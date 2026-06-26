@@ -1,0 +1,4 @@
+target/
+/tmp/raft-kv/
+*.wal
+.env
