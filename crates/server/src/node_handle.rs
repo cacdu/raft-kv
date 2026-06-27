@@ -67,6 +67,17 @@ impl NodeHandle {
             node.step(Message::Tick)
         };
         self.process_ready(ready).await;
+        self.update_state_metrics().await;
+    }
+
+    async fn update_state_metrics(&self) {
+        let (term, is_leader, commit) = {
+            let node = self.node.lock().await;
+            (node.current_term, node.is_leader(), node.commit_index)
+        };
+        crate::metrics::CURRENT_TERM.set(term as f64);
+        crate::metrics::IS_LEADER.set(if is_leader { 1.0 } else { 0.0 });
+        crate::metrics::COMMIT_INDEX.set(commit as f64);
     }
 
     /// Submit a command to the replicated log.
@@ -162,6 +173,7 @@ impl NodeHandle {
             }
         }
         let _ = self.applied_tx.send(snapshot.last_index);
+        crate::metrics::APPLIED_INDEX.set(snapshot.last_index as f64);
         *self.last_snapshot.lock().await = Some(snapshot);
     }
 
@@ -233,6 +245,7 @@ impl NodeHandle {
             // is guaranteed to find the value in the KV store.
             if let Some(max_idx) = ready.entries_to_apply.iter().map(|e| e.index).max() {
                 let _ = self.applied_tx.send(max_idx);
+                crate::metrics::APPLIED_INDEX.set(max_idx as f64);
                 // Compact the log every 50 applied entries to bound log size.
                 const COMPACTION_THRESHOLD: u64 = 50;
                 if max_idx % COMPACTION_THRESHOLD == 0 {

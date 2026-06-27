@@ -17,9 +17,13 @@ pub struct NodeConfig {
     #[arg(long)]
     pub http_addr: String,
 
-    /// Peer nodes: repeated --peer id=addr (e.g. --peer 2=127.0.0.1:7002)
+    /// Peer nodes gRPC addresses: repeated --peer id=grpc_addr
     #[arg(long = "peer", value_parser = parse_peer)]
     pub peers: Vec<(NodeId, String)>,
+
+    /// Peer nodes HTTP addresses for client redirects: repeated --http-peer id=http_addr
+    #[arg(long = "http-peer", value_parser = parse_peer)]
+    pub http_peers: Vec<(NodeId, String)>,
 
     #[arg(long, default_value = "data")]
     pub data_dir: PathBuf,
@@ -28,6 +32,10 @@ pub struct NodeConfig {
 impl NodeConfig {
     pub fn peers_map(&self) -> HashMap<NodeId, String> {
         self.peers.iter().cloned().collect()
+    }
+
+    pub fn http_peers_map(&self) -> HashMap<NodeId, String> {
+        self.http_peers.iter().cloned().collect()
     }
 }
 

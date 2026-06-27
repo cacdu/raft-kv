@@ -1,6 +1,7 @@
 mod config;
 mod grpc;
 mod http;
+mod metrics;
 mod node_handle;
 mod peer;
 
@@ -46,7 +47,8 @@ async fn main() -> Result<()> {
 
     // ── HTTP client API ──────────────────────────────────────────────────────
     let http_addr: SocketAddr = cfg.http_addr.parse()?;
-    let http_router = http::router(Arc::clone(&handle), Arc::clone(&kv), peers_map.clone());
+    let http_peers_map = cfg.http_peers_map();
+    let http_router = http::router(Arc::clone(&handle), Arc::clone(&kv), http_peers_map);
 
     // ── Raft tick loop ───────────────────────────────────────────────────────
     let tick_handle = Arc::clone(&handle);

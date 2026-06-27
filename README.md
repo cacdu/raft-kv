@@ -18,9 +18,9 @@ Distributed key-value store built on the Raft consensus algorithm, implemented f
           └───────────────────────┘
 ```
 
-Three nodes form a cluster. One is elected Leader via Raft. All writes go through the leader, which replicates entries to followers before committing. Reads are served locally (eventual) or through the leader (linearizable — TODO).
+Three nodes form a cluster. One is elected Leader via Raft. All writes go through the leader, which replicates entries to followers before committing. Reads use **linearizable ReadIndex**: the leader captures its commit index at request time and waits until that index is applied before serving the value.
 
-Non-leader nodes return `307 Redirect` pointing the client to the current leader.
+Non-leader nodes return `307 Redirect` to the leader's HTTP address (path-preserving), so any node can be addressed by a client.
 
 ## Crates
 
@@ -91,13 +91,20 @@ make node3
 
 Or manually:
 ```bash
+# --peer        id=grpc_addr   — used for Raft peer RPCs
+# --http-peer   id=http_addr   — used to redirect clients to the leader
 RUST_LOG=info cargo run -p server -- \
-  --id 1 --grpc-addr 127.0.0.1:7001 --http-addr 127.0.0.1:8001 \
-  --peer 2=127.0.0.1:7002 --peer 3=127.0.0.1:7003
+  --id 1 \
+  --grpc-addr 127.0.0.1:7001 --http-addr 127.0.0.1:8001 \
+  --peer 2=127.0.0.1:7002 --peer 3=127.0.0.1:7003 \
+  --http-peer 2=127.0.0.1:8002 --http-peer 3=127.0.0.1:8003
 
 # In another terminal
 raft-kv-cli set hello world
 raft-kv-cli get hello   # → world
+
+# Prometheus metrics
+curl http://127.0.0.1:8001/metrics
 ```
 
 ## Prerequisites
@@ -122,6 +129,7 @@ curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh
 | Async | tokio |
 | Persistence | Custom WAL (CRC32 + JSON) |
 | Serialization | serde_json (WAL), prost (gRPC) |
+| Observability | prometheus 0.13 |
 
 ---
 
@@ -136,15 +144,15 @@ curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh
 - [x] Write-Ahead Log with CRC32 integrity check
 - [x] WAL replay on startup (term, voted_for, log entries, snapshot)
 - [x] KV state machine (`set` / `delete`)
-- [x] HTTP API with leader redirect and linearizable ReadIndex reads
+- [x] HTTP API with linearizable ReadIndex reads
+- [x] Path-preserving `307 Redirect` on non-leader nodes (`--http-peer` flag)
 - [x] gRPC peer communication (tonic) with full response routing
 - [x] Snapshot transfer via `InstallSnapshot` RPC
 - [x] CLI client
 - [x] Unit tests — 15 for `raft` SM, 13 for `server` (WAL replay, proposals, ReadIndex)
-- [x] Integration test — leader election, writes, leader failover, data survives
+- [x] Integration + chaos tests (15/15): election, writes, failover, write-during-kill, WAL replay, minority partition
+- [x] Prometheus metrics at `GET /metrics` — counters, gauges, histograms
 
 ## Next steps
 
-- [ ] **Chaos tests** — write-during-kill, WAL replay after restart, minority partition recovery
-- [ ] **Metrics** — expose Prometheus metrics (term, commit index, role, replication lag)
 - [ ] **Membership changes** — add/remove nodes from a running cluster (joint consensus)
