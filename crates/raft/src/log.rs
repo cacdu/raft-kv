@@ -19,6 +19,10 @@ impl RaftLog {
         }
     }
 
+    pub fn snapshot_index(&self) -> LogIndex {
+        self.snapshot_index
+    }
+
     pub fn last_index(&self) -> LogIndex {
         self.snapshot_index + self.entries.len() as LogIndex - 1
     }
@@ -49,6 +53,15 @@ impl RaftLog {
         let offset = (after - self.snapshot_index) as usize;
         self.entries.truncate(offset);
         self.entries.extend(new_entries);
+    }
+
+    /// Restore log state from WAL replay.
+    /// `entries` must already be deduplicated (last writer wins per index).
+    pub fn restore(&mut self, snapshot_index: LogIndex, snapshot_term: Term, entries: Vec<LogEntry>) {
+        self.snapshot_index = snapshot_index;
+        self.snapshot_term = snapshot_term;
+        self.entries = vec![LogEntry { index: snapshot_index, term: snapshot_term, command: vec![] }];
+        self.entries.extend(entries);
     }
 
     /// Discard entries up to and including `index` (snapshot compaction).

@@ -1,7 +1,7 @@
 CARGO = cargo
 DATA  = /tmp/raft-kv
 
-.PHONY: build clean node1 node2 node3
+.PHONY: build clean node1 node2 node3 integration-test
 
 build:
 	$(CARGO) build
@@ -38,3 +38,6 @@ node3:
 		--peer 1=127.0.0.1:7001 \
 		--peer 2=127.0.0.1:7002 \
 		--data-dir $(DATA)/node3
+
+integration-test:
+	bash scripts/integration_test.sh

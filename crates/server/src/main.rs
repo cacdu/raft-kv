@@ -4,11 +4,11 @@ mod http;
 mod node_handle;
 mod peer;
 
-use std::{collections::HashMap, net::SocketAddr, sync::Arc};
+use std::{net::SocketAddr, sync::Arc};
 
 use anyhow::Result;
 use clap::Parser;
-use tokio::sync::{mpsc, Mutex};
+use tokio::sync::Mutex;
 use tracing::info;
 
 use config::NodeConfig;
@@ -35,13 +35,14 @@ async fn main() -> Result<()> {
     let kv = Arc::new(Mutex::new(KvStore::default()));
 
     // ── Raft node ────────────────────────────────────────────────────────────
-    let peers_map: std::collections::HashMap<_, _> = cfg.peers.iter().cloned().collect();
+    let peers_map = cfg.peers_map();
     let raft_config = raft::Config::new(cfg.id, peers_map.keys().copied().collect());
     let handle = Arc::new(NodeHandle::new(raft_config, records, Arc::clone(&kv), Arc::clone(&wal)));
+    handle.register_peers(peers_map.clone()).await;
 
     // ── gRPC peer server ─────────────────────────────────────────────────────
     let grpc_addr: SocketAddr = cfg.grpc_addr.parse()?;
-    let grpc_server = grpc::server(Arc::clone(&handle));
+    let grpc_server = grpc::server(Arc::clone(&handle), grpc_addr);
 
     // ── HTTP client API ──────────────────────────────────────────────────────
     let http_addr: SocketAddr = cfg.http_addr.parse()?;

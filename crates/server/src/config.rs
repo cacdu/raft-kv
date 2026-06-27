@@ -26,8 +26,7 @@ pub struct NodeConfig {
 }
 
 impl NodeConfig {
-    /// Returns peers as a map for convenience.
-    pub fn peers(&self) -> HashMap<NodeId, String> {
+    pub fn peers_map(&self) -> HashMap<NodeId, String> {
         self.peers.iter().cloned().collect()
     }
 }
@@ -40,9 +39,3 @@ fn parse_peer(s: &str) -> Result<(NodeId, String), String> {
     Ok((id, addr.to_string()))
 }
 
-// Re-export peers as HashMap for use in main.rs
-impl NodeConfig {
-    pub fn peers_map(&self) -> HashMap<NodeId, String> {
-        self.peers.iter().cloned().collect()
-    }
-}

@@ -132,26 +132,19 @@ curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh
 - [x] Commit index advancement (quorum-based)
 - [x] No-op entry on leader election (fixes stale commit index)
 - [x] Fast log rollback on conflict
-- [x] Log compaction skeleton (`RaftLog::compact`)
+- [x] Log compaction with WAL snapshot record
 - [x] Write-Ahead Log with CRC32 integrity check
+- [x] WAL replay on startup (term, voted_for, log entries, snapshot)
 - [x] KV state machine (`set` / `delete`)
-- [x] HTTP API with leader redirect
-- [x] gRPC peer communication (tonic)
+- [x] HTTP API with leader redirect and linearizable ReadIndex reads
+- [x] gRPC peer communication (tonic) with full response routing
+- [x] Snapshot transfer via `InstallSnapshot` RPC
 - [x] CLI client
+- [x] Unit tests — 15 for `raft` SM, 13 for `server` (WAL replay, proposals, ReadIndex)
+- [x] Integration test — leader election, writes, leader failover, data survives
 
 ## Next steps
 
-### Required to be production-correct
-
-- [ ] **WAL replay on startup** — `NodeHandle::new` receives WAL records but doesn't replay them yet. Restore `current_term`, `voted_for`, and log entries before starting the tick loop.
-- [ ] **gRPC response routing** — currently gRPC handlers return empty acks. Responses (vote granted / append success) need to be sent back through the Raft state machine as `Message::RequestVoteResponse` / `Message::AppendEntriesResponse`.
-- [ ] **Snapshot transfer** — when a follower is too far behind, the leader must send a full KV snapshot instead of individual log entries. Implement `InstallSnapshot` RPC.
-- [ ] **Linearizable reads** — reads currently serve stale data. To guarantee linearizability, reads must go through the leader and verify it's still leader (ReadIndex or lease-read).
-- [ ] **Persist hard state** — `current_term` and `voted_for` must be written to WAL before responding to any RPC, not just log entries.
-
-### Quality of life
-
-- [ ] **Unit tests for `raft` crate** — the pure state machine makes this straightforward. Test election, replication, and split-vote scenarios without any network.
-- [ ] **Membership changes** — add/remove nodes from a running cluster (joint consensus).
-- [ ] **Metrics** — expose Prometheus metrics (term, commit index, role, replication lag).
-- [ ] **Chaos tests** — kill nodes randomly, verify the cluster recovers and data is consistent.
+- [ ] **Chaos tests** — write-during-kill, WAL replay after restart, minority partition recovery
+- [ ] **Metrics** — expose Prometheus metrics (term, commit index, role, replication lag)
+- [ ] **Membership changes** — add/remove nodes from a running cluster (joint consensus)

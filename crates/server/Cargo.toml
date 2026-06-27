@@ -27,3 +27,6 @@ clap    = { workspace = true }
 
 [build-dependencies]
 tonic-build = "0.12"
+
+[dev-dependencies]
+tempfile = { workspace = true }

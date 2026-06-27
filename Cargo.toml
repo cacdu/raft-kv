@@ -34,3 +34,4 @@ clap = { version = "4", features = ["derive"] }
 rand = "0.9"
 crc32fast = "1"
 bytes = "1"
+tempfile = "3"

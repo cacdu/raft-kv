@@ -6,7 +6,7 @@
 /// GET    /status           → 200 JSON { id, role, leader_id, commit_index }
 ///
 /// Non-leader nodes return 307 Redirect to the leader's HTTP address.
-use std::{collections::HashMap, sync::Arc};
+use std::{collections::HashMap, sync::Arc, time::Duration};
 
 use axum::{
     Router,
@@ -14,7 +14,7 @@ use axum::{
     extract::{Path, State},
     http::StatusCode,
     response::{IntoResponse, Redirect, Response},
-    routing::{delete, get, put},
+    routing::get,
 };
 use tokio::sync::Mutex;
 
@@ -44,6 +44,29 @@ pub fn router(
 }
 
 async fn kv_get(Path(key): Path<String>, State(s): State<AppState>) -> Response {
+    // ReadIndex: only the leader serves reads; followers redirect.
+    let read_index = match s.handle.read_index_if_leader().await {
+        Some(idx) => idx,
+        None => return redirect_to_leader(&s).await,
+    };
+
+    // Wait until the leader has applied at least read_index to its KV store.
+    // This ensures the read reflects every write that completed before this request.
+    let mut applied_rx = s.handle.subscribe_applied();
+    let wait = tokio::time::timeout(Duration::from_secs(5), async {
+        loop {
+            if *applied_rx.borrow() >= read_index {
+                break;
+            }
+            if applied_rx.changed().await.is_err() {
+                break; // sender dropped (shutdown) — serve whatever we have
+            }
+        }
+    });
+    if wait.await.is_err() {
+        return (StatusCode::SERVICE_UNAVAILABLE, "read timeout").into_response();
+    }
+
     let kv = s.kv.lock().await;
     match kv.get(&key) {
         Some(v) => (StatusCode::OK, v.to_string()).into_response(),
@@ -60,25 +83,28 @@ async fn kv_put(
         Ok(v) => v,
         Err(_) => return StatusCode::BAD_REQUEST.into_response(),
     };
-
-    if !s.handle.is_leader().await {
-        return redirect_to_leader(&s).await;
-    }
-
     let cmd = Command::Set { key, value };
     let bytes = serde_json::to_vec(&cmd).unwrap();
-    s.handle.propose(bytes).await;
-    StatusCode::OK.into_response()
+    await_commit(&s, bytes).await
 }
 
 async fn kv_delete(Path(key): Path<String>, State(s): State<AppState>) -> Response {
-    if !s.handle.is_leader().await {
-        return redirect_to_leader(&s).await;
-    }
     let cmd = Command::Delete { key };
     let bytes = serde_json::to_vec(&cmd).unwrap();
-    s.handle.propose(bytes).await;
-    StatusCode::OK.into_response()
+    await_commit(&s, bytes).await
+}
+
+/// Propose a command and wait for it to be committed, with a 5-second timeout.
+async fn await_commit(s: &AppState, command: Vec<u8>) -> Response {
+    let rx = match s.handle.propose(command).await {
+        None => return redirect_to_leader(s).await,
+        Some(rx) => rx,
+    };
+    match tokio::time::timeout(Duration::from_secs(5), rx).await {
+        Ok(Ok(())) => StatusCode::OK.into_response(),
+        Ok(Err(_)) => (StatusCode::SERVICE_UNAVAILABLE, "proposal dropped").into_response(),
+        Err(_) => (StatusCode::SERVICE_UNAVAILABLE, "proposal timeout").into_response(),
+    }
 }
 
 async fn status(State(s): State<AppState>) -> impl IntoResponse {

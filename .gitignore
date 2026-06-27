@@ -2,3 +2,8 @@ target/
 /tmp/raft-kv/
 *.wal
 .env
+PLAN.md
+FASE1.md
+FASE2.md
+FASE3.md
+FASE4.md

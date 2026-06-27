@@ -5,6 +5,12 @@ pub type Term = u64;
 pub type LogIndex = u64;
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct HardState {
+    pub term: Term,
+    pub voted_for: Option<NodeId>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct LogEntry {
     pub index: LogIndex,
     pub term: Term,
@@ -47,6 +53,30 @@ pub struct AppendEntriesResponse {
     pub match_index: LogIndex,
 }
 
+// ── Snapshot ───────────────────────────────────────────────────────────────
+
+/// Compact representation of the KV state machine at a given log position.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct Snapshot {
+    pub last_index: LogIndex,
+    pub last_term:  Term,
+    /// Serialized KV store (serde_json of the BTreeMap).
+    pub data:       Vec<u8>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct InstallSnapshot {
+    pub term:      Term,
+    pub leader_id: NodeId,
+    pub snapshot:  Snapshot,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct InstallSnapshotResponse {
+    pub term:    Term,
+    pub success: bool,
+}
+
 // ── Internal messages ──────────────────────────────────────────────────────
 
 /// All inputs to the Raft state machine.
@@ -62,4 +92,6 @@ pub enum Message {
     RequestVoteResponse { from: NodeId, msg: RequestVoteResponse },
     AppendEntries { from: NodeId, msg: AppendEntries },
     AppendEntriesResponse { from: NodeId, msg: AppendEntriesResponse },
+    InstallSnapshot { from: NodeId, msg: InstallSnapshot },
+    InstallSnapshotResponse { from: NodeId, msg: InstallSnapshotResponse },
 }

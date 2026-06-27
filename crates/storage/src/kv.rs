@@ -16,6 +16,9 @@ pub struct KvStore {
 
 impl KvStore {
     pub fn apply(&mut self, command_bytes: &[u8]) -> Result<(), serde_json::Error> {
+        if command_bytes.is_empty() {
+            return Ok(());
+        }
         let cmd: Command = serde_json::from_slice(command_bytes)?;
         match cmd {
             Command::Set { key, value } => {
