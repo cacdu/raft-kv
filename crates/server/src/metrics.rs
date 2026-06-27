@@ -1,8 +1,7 @@
 use std::sync::LazyLock;
 
 use prometheus::{
-    Counter, Gauge, HistogramVec,
-    register_counter, register_gauge, register_histogram_vec,
+    register_counter, register_gauge, register_histogram_vec, Counter, Gauge, HistogramVec,
 };
 
 pub static WRITES_TOTAL: LazyLock<Counter> = LazyLock::new(|| {
@@ -14,21 +13,26 @@ pub static WRITES_TOTAL: LazyLock<Counter> = LazyLock::new(|| {
 });
 
 pub static READS_TOTAL: LazyLock<Counter> = LazyLock::new(|| {
-    register_counter!("raft_kv_reads_total", "Total read operations served by the leader")
-        .unwrap()
+    register_counter!(
+        "raft_kv_reads_total",
+        "Total read operations served by the leader"
+    )
+    .unwrap()
 });
 
 pub static APPLIED_INDEX: LazyLock<Gauge> = LazyLock::new(|| {
-    register_gauge!("raft_kv_applied_index", "Last log index applied to the KV store").unwrap()
+    register_gauge!(
+        "raft_kv_applied_index",
+        "Last log index applied to the KV store"
+    )
+    .unwrap()
 });
 
-pub static COMMIT_INDEX: LazyLock<Gauge> = LazyLock::new(|| {
-    register_gauge!("raft_kv_commit_index", "Current Raft commit index").unwrap()
-});
+pub static COMMIT_INDEX: LazyLock<Gauge> =
+    LazyLock::new(|| register_gauge!("raft_kv_commit_index", "Current Raft commit index").unwrap());
 
-pub static CURRENT_TERM: LazyLock<Gauge> = LazyLock::new(|| {
-    register_gauge!("raft_kv_current_term", "Current Raft term").unwrap()
-});
+pub static CURRENT_TERM: LazyLock<Gauge> =
+    LazyLock::new(|| register_gauge!("raft_kv_current_term", "Current Raft term").unwrap());
 
 pub static IS_LEADER: LazyLock<Gauge> = LazyLock::new(|| {
     register_gauge!("raft_kv_is_leader", "1 if this node is leader, 0 otherwise").unwrap()

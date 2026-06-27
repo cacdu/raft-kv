@@ -1,4 +1,4 @@
-use crate::message::{LogEntry, LogIndex, Term};
+use crate::message::{EntryType, LogEntry, LogIndex, Term};
 
 /// In-memory Raft log. Entries are 1-indexed; index 0 is a sentinel.
 #[derive(Debug)]
@@ -13,7 +13,12 @@ impl RaftLog {
     pub fn new() -> Self {
         Self {
             // Sentinel at position 0: index=0, term=0
-            entries: vec![LogEntry { index: 0, term: 0, command: vec![] }],
+            entries: vec![LogEntry {
+                index: 0,
+                term: 0,
+                entry_type: EntryType::Normal,
+                command: vec![],
+            }],
             snapshot_index: 0,
             snapshot_term: 0,
         }
@@ -28,7 +33,10 @@ impl RaftLog {
     }
 
     pub fn last_term(&self) -> Term {
-        self.entries.last().map(|e| e.term).unwrap_or(self.snapshot_term)
+        self.entries
+            .last()
+            .map(|e| e.term)
+            .unwrap_or(self.snapshot_term)
     }
 
     pub fn term_at(&self, index: LogIndex) -> Option<Term> {
@@ -57,10 +65,20 @@ impl RaftLog {
 
     /// Restore log state from WAL replay.
     /// `entries` must already be deduplicated (last writer wins per index).
-    pub fn restore(&mut self, snapshot_index: LogIndex, snapshot_term: Term, entries: Vec<LogEntry>) {
+    pub fn restore(
+        &mut self,
+        snapshot_index: LogIndex,
+        snapshot_term: Term,
+        entries: Vec<LogEntry>,
+    ) {
         self.snapshot_index = snapshot_index;
         self.snapshot_term = snapshot_term;
-        self.entries = vec![LogEntry { index: snapshot_index, term: snapshot_term, command: vec![] }];
+        self.entries = vec![LogEntry {
+            index: snapshot_index,
+            term: snapshot_term,
+            entry_type: EntryType::Normal,
+            command: vec![],
+        }];
         self.entries.extend(entries);
     }
 
@@ -71,7 +89,15 @@ impl RaftLog {
         self.snapshot_index = index;
         self.snapshot_term = term;
         // Re-insert sentinel
-        self.entries.insert(0, LogEntry { index, term, command: vec![] });
+        self.entries.insert(
+            0,
+            LogEntry {
+                index,
+                term,
+                entry_type: EntryType::Normal,
+                command: vec![],
+            },
+        );
     }
 }
 

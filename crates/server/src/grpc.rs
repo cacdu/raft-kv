@@ -2,10 +2,10 @@
 use std::{net::SocketAddr, sync::Arc};
 
 use anyhow::Result;
-use tonic::{Request, Response, Status, transport::Server};
+use tonic::{transport::Server, Request, Response, Status};
 
 use raft::{
-    message::{AppendEntries, InstallSnapshot, LogEntry, RequestVote, Snapshot},
+    message::{AppendEntries, EntryType, InstallSnapshot, LogEntry, RequestVote, Snapshot},
     Message,
 };
 
@@ -17,9 +17,9 @@ pub mod proto {
 
 use proto::{
     raft_service_server::{RaftService, RaftServiceServer},
-    AppendEntriesRequest, AppendEntriesResponse as ProtoAEResponse,
-    InstallSnapshotRequest, InstallSnapshotResponse as ProtoISResponse,
-    RequestVoteRequest, RequestVoteResponse as ProtoRVResponse,
+    AppendEntriesRequest, AppendEntriesResponse as ProtoAEResponse, InstallSnapshotRequest,
+    InstallSnapshotResponse as ProtoISResponse, RequestVoteRequest,
+    RequestVoteResponse as ProtoRVResponse,
 };
 
 struct RaftGrpc {
@@ -50,7 +50,10 @@ impl RaftService for RaftGrpc {
             _ => return Err(Status::internal("SM produced no RequestVoteResponse")),
         };
 
-        Ok(Response::new(ProtoRVResponse { term: rv.term, vote_granted: rv.vote_granted }))
+        Ok(Response::new(ProtoRVResponse {
+            term: rv.term,
+            vote_granted: rv.vote_granted,
+        }))
     }
 
     async fn append_entries(
@@ -61,7 +64,16 @@ impl RaftService for RaftGrpc {
         let entries = r
             .entries
             .into_iter()
-            .map(|e| LogEntry { index: e.index, term: e.term, command: e.command.to_vec() })
+            .map(|e| LogEntry {
+                index: e.index,
+                term: e.term,
+                entry_type: if e.entry_type == 1 {
+                    EntryType::ConfChange
+                } else {
+                    EntryType::Normal
+                },
+                command: e.command.to_vec(),
+            })
             .collect();
         let msg = Message::AppendEntries {
             from: r.leader_id,
@@ -114,7 +126,10 @@ impl RaftService for RaftGrpc {
             _ => return Err(Status::internal("SM produced no InstallSnapshotResponse")),
         };
 
-        Ok(Response::new(ProtoISResponse { term: isr.term, success: isr.success }))
+        Ok(Response::new(ProtoISResponse {
+            term: isr.term,
+            success: isr.success,
+        }))
     }
 }
 

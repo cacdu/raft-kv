@@ -6,9 +6,12 @@ use std::{collections::HashMap, sync::Arc};
 use tokio::sync::{oneshot, watch, Mutex};
 use tracing::{debug, warn};
 
-use raft::{Config, HardState, LogEntry, LogIndex, Message, NodeId, RaftNode, Ready, Snapshot, Term};
-use storage::{KvStore, Wal};
+use raft::{
+    ConfChangeCmd, ConfChangeOp, Config, HardState, LogEntry, LogIndex, Message, NodeId, RaftNode,
+    Ready, Snapshot, Term,
+};
 use storage::wal::WalRecord;
+use storage::{KvStore, Wal};
 
 use crate::peer::PeerClient;
 
@@ -17,6 +20,8 @@ pub struct NodeHandle {
     kv: Arc<Mutex<KvStore>>,
     wal: Arc<Mutex<Wal>>,
     peers: Mutex<HashMap<NodeId, PeerClient>>,
+    /// HTTP addresses for peer nodes — used to forward client requests to the leader.
+    pub http_peers: Mutex<HashMap<NodeId, String>>,
     /// Waiting HTTP handlers: log index → oneshot sender notified on commit.
     pending_proposals: Mutex<HashMap<LogIndex, oneshot::Sender<()>>>,
     /// Broadcast channel: carries the highest log index applied to the KV store.
@@ -34,7 +39,24 @@ impl NodeHandle {
         kv: Arc<Mutex<KvStore>>,
         wal: Arc<Mutex<Wal>>,
     ) -> Self {
-        let mut node = RaftNode::new(config);
+        Self::new_inner(RaftNode::new(config), records, kv, wal)
+    }
+
+    pub fn new_learner(
+        config: Config,
+        records: Vec<WalRecord>,
+        kv: Arc<Mutex<KvStore>>,
+        wal: Arc<Mutex<Wal>>,
+    ) -> Self {
+        Self::new_inner(RaftNode::new_learner(config), records, kv, wal)
+    }
+
+    fn new_inner(
+        mut node: RaftNode,
+        records: Vec<WalRecord>,
+        kv: Arc<Mutex<KvStore>>,
+        wal: Arc<Mutex<Wal>>,
+    ) -> Self {
         if !records.is_empty() {
             let (term, voted_for) = replay_hard_state(&records);
             let (snapshot_index, snapshot_term) = replay_snapshot(&records);
@@ -47,6 +69,7 @@ impl NodeHandle {
             kv,
             wal,
             peers: Mutex::new(HashMap::new()),
+            http_peers: Mutex::new(HashMap::new()),
             pending_proposals: Mutex::new(HashMap::new()),
             applied_tx,
             applied_rx,
@@ -54,11 +77,47 @@ impl NodeHandle {
         }
     }
 
-    pub async fn register_peers(&self, peers: HashMap<NodeId, String>) {
+    pub async fn register_peers(
+        &self,
+        raft_peers: HashMap<NodeId, String>,
+        http_peers: HashMap<NodeId, String>,
+    ) {
         let mut map = self.peers.lock().await;
-        for (id, addr) in peers {
+        for (id, addr) in raft_peers {
             map.insert(id, PeerClient::new(id, addr));
         }
+        let mut http = self.http_peers.lock().await;
+        for (id, addr) in http_peers {
+            http.insert(id, addr);
+        }
+    }
+
+    /// Propose a membership change to the cluster.
+    /// Returns a receiver that resolves when the entry is committed, or None if not leader.
+    pub async fn propose_conf_change(
+        &self,
+        op: ConfChangeOp,
+        node_id: NodeId,
+        raft_addr: Option<String>,
+        http_addr: Option<String>,
+    ) -> Option<oneshot::Receiver<()>> {
+        let (tx, rx) = oneshot::channel();
+        let ready = {
+            let mut node = self.node.lock().await;
+            if !node.is_leader() {
+                return None;
+            }
+            let index = node.log.last_index() + 1;
+            self.pending_proposals.lock().await.insert(index, tx);
+            node.step(Message::ProposeConfChange {
+                op,
+                node_id,
+                raft_addr,
+                http_addr,
+            })
+        };
+        self.process_ready(ready).await;
+        Some(rx)
     }
 
     pub async fn tick(&self) {
@@ -113,7 +172,11 @@ impl NodeHandle {
     /// Returns None for followers — callers should redirect to the leader.
     pub async fn read_index_if_leader(&self) -> Option<LogIndex> {
         let node = self.node.lock().await;
-        if node.is_leader() { Some(node.commit_index) } else { None }
+        if node.is_leader() {
+            Some(node.commit_index)
+        } else {
+            None
+        }
     }
 
     /// Subscribe to applied-index updates. The returned receiver resolves each time
@@ -132,18 +195,27 @@ impl NodeHandle {
         };
         let (last_index, last_term) = {
             let mut node = self.node.lock().await;
-            if index > node.commit_index { return; }
+            if index > node.commit_index {
+                return;
+            }
             let term = node.log.term_at(index).unwrap_or(0);
             node.log.compact(index, term);
             (index, term)
         };
         {
             let mut wal = self.wal.lock().await;
-            if let Err(e) = wal.append(&WalRecord::Snapshot { last_index, last_term }) {
+            if let Err(e) = wal.append(&WalRecord::Snapshot {
+                last_index,
+                last_term,
+            }) {
                 warn!("WAL snapshot write failed: {e}");
             }
         }
-        let snap = Snapshot { last_index, last_term, data };
+        let snap = Snapshot {
+            last_index,
+            last_term,
+            data,
+        };
         *self.last_snapshot.lock().await = Some(snap);
         debug!(index = last_index, "snapshot taken");
     }
@@ -161,7 +233,13 @@ impl NodeHandle {
         {
             let mut node = self.node.lock().await;
             let (term, voted_for) = (node.current_term, node.voted_for);
-            node.restore(term, voted_for, snapshot.last_index, snapshot.last_term, vec![]);
+            node.restore(
+                term,
+                voted_for,
+                snapshot.last_index,
+                snapshot.last_term,
+                vec![],
+            );
         }
         {
             let mut wal = self.wal.lock().await;
@@ -199,11 +277,15 @@ impl NodeHandle {
             let mut node = self.node.lock().await;
             node.step(msg)
         };
-        let response = ready.messages.iter()
-            .find(|(_, m)| matches!(
-                m,
-                Message::RequestVoteResponse { .. } | Message::AppendEntriesResponse { .. }
-            ))
+        let response = ready
+            .messages
+            .iter()
+            .find(|(_, m)| {
+                matches!(
+                    m,
+                    Message::RequestVoteResponse { .. } | Message::AppendEntriesResponse { .. }
+                )
+            })
             .map(|(_, m)| m.clone());
         self.persist(&ready).await;
         self.drain_if_lost_leadership(&ready).await;
@@ -258,6 +340,31 @@ impl NodeHandle {
         if let Some(snap) = ready.snapshot_to_apply.clone() {
             self.apply_snapshot(snap).await;
         }
+
+        // A ConfChange entry was applied — update peer connection maps.
+        if let Some(cmd) = ready.membership_change.clone() {
+            self.apply_membership_cmd(cmd).await;
+        }
+    }
+
+    async fn apply_membership_cmd(&self, cmd: ConfChangeCmd) {
+        match cmd.op {
+            ConfChangeOp::Add => {
+                if let Some(raft_addr) = cmd.raft_addr {
+                    self.peers
+                        .lock()
+                        .await
+                        .insert(cmd.node_id, PeerClient::new(cmd.node_id, raft_addr));
+                }
+                if let Some(http_addr) = cmd.http_addr {
+                    self.http_peers.lock().await.insert(cmd.node_id, http_addr);
+                }
+            }
+            ConfChangeOp::Remove => {
+                self.peers.lock().await.remove(&cmd.node_id);
+                self.http_peers.lock().await.remove(&cmd.node_id);
+            }
+        }
     }
 
     async fn process_ready(&self, ready: Ready) {
@@ -270,14 +377,26 @@ impl NodeHandle {
                 let leader_term = self.node.lock().await.current_term;
                 let clients: Vec<PeerClient> = {
                     let peers = self.peers.lock().await;
-                    ready.snapshot_to_send.iter()
+                    ready
+                        .snapshot_to_send
+                        .iter()
                         .filter_map(|id| peers.get(id).cloned())
                         .collect()
                 };
                 for client in clients {
-                    debug!(peer = client.id, index = snap.last_index, "sending snapshot");
-                    if let Some(resp) = client.send_install_snapshot(leader_term, snap.clone()).await {
-                        let inner = { let mut node = self.node.lock().await; node.step(resp) };
+                    debug!(
+                        peer = client.id,
+                        index = snap.last_index,
+                        "sending snapshot"
+                    );
+                    if let Some(resp) = client
+                        .send_install_snapshot(leader_term, snap.clone())
+                        .await
+                    {
+                        let inner = {
+                            let mut node = self.node.lock().await;
+                            node.step(resp)
+                        };
                         self.persist(&inner).await;
                     }
                 }
@@ -291,7 +410,8 @@ impl NodeHandle {
         // Clone peer clients before releasing the lock so we can await I/O without holding it.
         let sends: Vec<(PeerClient, Message)> = {
             let peers = self.peers.lock().await;
-            ready.messages
+            ready
+                .messages
                 .into_iter()
                 .filter_map(|(dest, msg)| peers.get(&dest).cloned().map(|c| (c, msg)))
                 .collect()
@@ -324,6 +444,9 @@ impl NodeHandle {
                 combined.entries_to_persist.extend(r.entries_to_persist);
                 combined.entries_to_apply.extend(r.entries_to_apply);
                 combined.messages.extend(r.messages);
+                if r.membership_change.is_some() {
+                    combined.membership_change = r.membership_change;
+                }
             }
             combined
         };
@@ -337,7 +460,8 @@ impl NodeHandle {
         if !inner_ready.messages.is_empty() {
             let sends2: Vec<(PeerClient, Message)> = {
                 let peers = self.peers.lock().await;
-                inner_ready.messages
+                inner_ready
+                    .messages
                     .into_iter()
                     .filter_map(|(dest, msg)| peers.get(&dest).cloned().map(|c| (c, msg)))
                     .collect()
@@ -358,7 +482,11 @@ fn replay_hard_state(records: &[WalRecord]) -> (Term, Option<NodeId>) {
     let mut term: Term = 0;
     let mut voted_for: Option<NodeId> = None;
     for r in records {
-        if let WalRecord::HardState { term: t, voted_for: v } = r {
+        if let WalRecord::HardState {
+            term: t,
+            voted_for: v,
+        } = r
+        {
             term = *t;
             voted_for = *v;
         }
@@ -370,7 +498,11 @@ fn replay_snapshot(records: &[WalRecord]) -> (LogIndex, Term) {
     let mut snapshot_index: LogIndex = 0;
     let mut snapshot_term: Term = 0;
     for r in records {
-        if let WalRecord::Snapshot { last_index, last_term } = r {
+        if let WalRecord::Snapshot {
+            last_index,
+            last_term,
+        } = r
+        {
             snapshot_index = *last_index;
             snapshot_term = *last_term;
         }
@@ -397,11 +529,16 @@ fn replay_entries(records: &[WalRecord]) -> Vec<LogEntry> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use raft::LogEntry;
+    use raft::{message::EntryType, LogEntry};
     use storage::wal::WalRecord;
 
     fn entry(index: u64, term: u64) -> WalRecord {
-        WalRecord::Entry(LogEntry { index, term, command: vec![] })
+        WalRecord::Entry(LogEntry {
+            index,
+            term,
+            entry_type: EntryType::Normal,
+            command: vec![],
+        })
     }
 
     fn hard_state(term: u64, voted_for: Option<u64>) -> WalRecord {
@@ -453,7 +590,10 @@ mod tests {
         let entries = replay_entries(&records);
         assert_eq!(entries.len(), 3);
         assert_eq!(entries[1].index, 2);
-        assert_eq!(entries[1].term, 2, "conflict at index 2: term 2 must win over term 1");
+        assert_eq!(
+            entries[1].term, 2,
+            "conflict at index 2: term 2 must win over term 1"
+        );
         assert_eq!(entries[2].term, 2, "entry 3 from term 2 must be kept");
     }
 
@@ -462,7 +602,10 @@ mod tests {
         let records = vec![
             hard_state(1, Some(2)),
             entry(1, 1),
-            WalRecord::Snapshot { last_index: 5, last_term: 1 },
+            WalRecord::Snapshot {
+                last_index: 5,
+                last_term: 1,
+            },
             entry(6, 2),
         ];
         let entries = replay_entries(&records);
@@ -478,8 +621,14 @@ mod tests {
     #[test]
     fn replay_snapshot_returns_last() {
         let records = vec![
-            WalRecord::Snapshot { last_index: 10, last_term: 2 },
-            WalRecord::Snapshot { last_index: 20, last_term: 3 },
+            WalRecord::Snapshot {
+                last_index: 10,
+                last_term: 2,
+            },
+            WalRecord::Snapshot {
+                last_index: 20,
+                last_term: 3,
+            },
         ];
         let (idx, term) = replay_snapshot(&records);
         assert_eq!(idx, 20);
@@ -522,8 +671,14 @@ mod tests {
         });
 
         // Both receivers should immediately resolve with Err (senders were dropped).
-        assert!(rx1.try_recv().is_err(), "rx1 should be resolved after drain");
-        assert!(rx2.try_recv().is_err(), "rx2 should be resolved after drain");
+        assert!(
+            rx1.try_recv().is_err(),
+            "rx1 should be resolved after drain"
+        );
+        assert!(
+            rx2.try_recv().is_err(),
+            "rx2 should be resolved after drain"
+        );
         rt.block_on(async {
             assert!(
                 handle.pending_proposals.lock().await.is_empty(),
@@ -550,7 +705,10 @@ mod tests {
             // Build a Ready that looks like a term bump (hard_state present)
             // The node is still a follower (never became leader), so is_leader() == false
             let ready = raft::Ready {
-                hard_state: Some(raft::HardState { term: 3, voted_for: Some(2) }),
+                hard_state: Some(raft::HardState {
+                    term: 3,
+                    voted_for: Some(2),
+                }),
                 ..Default::default()
             };
 
@@ -558,7 +716,10 @@ mod tests {
         });
 
         // The sender was dropped → receiver resolves with Err immediately
-        assert!(rx.try_recv().is_err(), "proposal must be drained on leadership loss");
+        assert!(
+            rx.try_recv().is_err(),
+            "proposal must be drained on leadership loss"
+        );
         rt.block_on(async {
             assert!(handle.pending_proposals.lock().await.is_empty());
         });
@@ -574,11 +735,15 @@ mod tests {
         rt.block_on(async {
             handle.pending_proposals.lock().await.insert(1, tx);
 
-            let ready = raft::Ready { hard_state: None, ..Default::default() };
+            let ready = raft::Ready {
+                hard_state: None,
+                ..Default::default()
+            };
             handle.drain_if_lost_leadership(&ready).await;
 
             assert_eq!(
-                handle.pending_proposals.lock().await.len(), 1,
+                handle.pending_proposals.lock().await.len(),
+                1,
                 "proposals must survive when no role change occurred"
             );
         });
@@ -604,21 +769,35 @@ mod tests {
 
         let ready = Ready {
             entries_to_apply: vec![
-                LogEntry { index: 1, term: 1, command: vec![] },
-                LogEntry { index: 2, term: 1, command: vec![] },
+                LogEntry {
+                    index: 1,
+                    term: 1,
+                    entry_type: EntryType::Normal,
+                    command: vec![],
+                },
+                LogEntry {
+                    index: 2,
+                    term: 1,
+                    entry_type: EntryType::Normal,
+                    command: vec![],
+                },
             ],
             ..Default::default()
         };
         rt.block_on(handle.persist(&ready));
 
         // The watch must have advanced to 2 (the max applied index).
-        assert_eq!(*rx.borrow(), 2, "applied watch must advance to max applied index");
+        assert_eq!(
+            *rx.borrow(),
+            2,
+            "applied watch must advance to max applied index"
+        );
     }
 
     fn make_handle(id: u64, peers: Vec<u64>) -> Arc<NodeHandle> {
         use raft::Config;
-        use storage::{KvStore, Wal};
         use std::sync::Arc;
+        use storage::{KvStore, Wal};
         use tokio::sync::Mutex;
 
         let cfg = Config::new(id, peers);

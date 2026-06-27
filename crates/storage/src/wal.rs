@@ -28,9 +28,15 @@ pub enum WalError {
 
 #[derive(Debug, Serialize, Deserialize)]
 pub enum WalRecord {
-    HardState { term: Term, voted_for: Option<NodeId> },
+    HardState {
+        term: Term,
+        voted_for: Option<NodeId>,
+    },
     Entry(LogEntry),
-    Snapshot { last_index: LogIndex, last_term: Term },
+    Snapshot {
+        last_index: LogIndex,
+        last_term: Term,
+    },
 }
 
 pub struct Wal {
@@ -88,7 +94,10 @@ impl Wal {
             let mut h = Hasher::new();
             h.update(&payload);
             if h.finalize() != expected_crc {
-                return Err(WalError::Corrupt { offset, reason: "checksum mismatch" });
+                return Err(WalError::Corrupt {
+                    offset,
+                    reason: "checksum mismatch",
+                });
             }
 
             records.push(serde_json::from_slice(&payload)?);
