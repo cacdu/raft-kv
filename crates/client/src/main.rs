@@ -13,9 +13,21 @@ struct Cli {
 
 #[derive(Subcommand)]
 enum Cmd {
-    Get { key: String },
-    Set { key: String, value: String },
-    Delete { key: String },
+    Get {
+        key: String,
+    },
+    Set {
+        key: String,
+        value: String,
+    },
+    Delete {
+        key: String,
+    },
+    /// Scan all keys with the given prefix (empty string = all keys).
+    Scan {
+        #[arg(long, default_value = "")]
+        prefix: String,
+    },
     Status,
 }
 
@@ -43,9 +55,25 @@ async fn main() -> Result<()> {
             println!("ok");
         }
         Cmd::Delete { key } => {
-            let res = client.delete(format!("{}/kv/{key}", cli.addr)).send().await?;
+            let res = client
+                .delete(format!("{}/kv/{key}", cli.addr))
+                .send()
+                .await?;
             anyhow::ensure!(res.status().is_success(), "delete failed: {}", res.status());
             println!("ok");
+        }
+        Cmd::Scan { prefix } => {
+            let url = format!("{}/kv?prefix={}", cli.addr, urlencoding::encode(&prefix));
+            let res = client.get(url).send().await?;
+            anyhow::ensure!(res.status().is_success(), "scan failed: {}", res.status());
+            let map: std::collections::BTreeMap<String, String> = res.json().await?;
+            if map.is_empty() {
+                println!("(empty)");
+            } else {
+                for (k, v) in &map {
+                    println!("{k} = {v}");
+                }
+            }
         }
         Cmd::Status => {
             let res = client.get(format!("{}/status", cli.addr)).send().await?;

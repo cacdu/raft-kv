@@ -35,6 +35,15 @@ impl KvStore {
         self.data.get(key).map(|s| s.as_str())
     }
 
+    /// Return all key-value pairs whose key starts with `prefix`, ordered lexicographically.
+    pub fn scan_prefix(&self, prefix: &str) -> Vec<(&str, &str)> {
+        self.data
+            .range(prefix.to_string()..)
+            .take_while(|(k, _)| k.starts_with(prefix))
+            .map(|(k, v)| (k.as_str(), v.as_str()))
+            .collect()
+    }
+
     pub fn snapshot(&self) -> Vec<u8> {
         serde_json::to_vec(&self.data).unwrap_or_default()
     }
