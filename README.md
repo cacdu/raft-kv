@@ -1,158 +1,238 @@
 # raft-kv
 
-Distributed key-value store built on the Raft consensus algorithm, implemented from scratch in Rust.
+[![CI](https://github.com/cacdu/raft-kv/actions/workflows/ci.yml/badge.svg)](https://github.com/cacdu/raft-kv/actions/workflows/ci.yml)
+![Rust](https://img.shields.io/badge/rust-stable-orange)
+![License](https://img.shields.io/badge/license-MIT-blue)
+
+A distributed key-value store built on a from-scratch Raft implementation in Rust.
+Designed as a learning-grade TiKV — minimal, readable, and production-pattern-complete.
+
+```
+$ curl -X PUT http://127.0.0.1:8001/kv/hello -d "world"
+$ curl http://127.0.0.1:8002/kv/hello   # any node, redirects to leader
+world
+```
+
+---
+
+## What it does
+
+- **Consensus** — full Raft: leader election, log replication, log compaction, snapshot install, membership changes (add/remove nodes at runtime)
+- **Linearizable reads** — ReadIndex protocol: reads always reflect the latest committed write
+- **Fault tolerance** — cluster stays available as long as a majority is up; minority partitions heal automatically
+- **HTTP API** — `GET`, `PUT`, `DELETE /kv/{key}`, prefix scan `GET /kv?prefix=`, `307 Redirect` from followers to leader
+- **gRPC peer RPCs** — `RequestVote`, `AppendEntries`, `InstallSnapshot` via tonic
+- **Durable WAL** — append-only write-ahead log with CRC32 integrity check; survives crashes
+- **Observability** — Prometheus metrics at `GET /metrics`
+
+---
 
 ## Architecture
 
 ```
-┌─────────────────────────────────────────────────────────────┐
-│                        Client                               │
-│              curl / raft-kv-cli                             │
-└─────────────────────┬───────────────────────────────────────┘
-                      │ HTTP (GET/PUT/DELETE /kv/{key})
-          ┌───────────▼───────────┐
-          │       Node 1          │  ◄──gRPC──►  Node 2
-          │   Axum HTTP server    │  ◄──gRPC──►  Node 3
-          │   Raft state machine  │
-          │   WAL + KV store      │
-          └───────────────────────┘
+  Client (curl / raft-kv-cli)
+       │
+       │  HTTP  (GET/PUT/DELETE /kv/{key})
+       ▼
+  ┌────────────┐     gRPC (RequestVote      ┌────────────┐
+  │   Node 1   │◄────AppendEntries    ──────│   Node 2   │
+  │  (Leader)  │     InstallSnapshot)       │ (Follower) │
+  │            │────────────────────────────│            │
+  │ ┌────────┐ │                            └────────────┘
+  │ │  Raft  │ │
+  │ │   SM   │ │     gRPC                   ┌────────────┐
+  │ └────────┘ │────────────────────────────│   Node 3   │
+  │ ┌────────┐ │                            │ (Follower) │
+  │ │  WAL   │ │                            └────────────┘
+  │ │  + KV  │ │
+  │ └────────┘ │
+  └────────────┘
 ```
 
-Three nodes form a cluster. One is elected Leader via Raft. All writes go through the leader, which replicates entries to followers before committing. Reads use **linearizable ReadIndex**: the leader captures its commit index at request time and waits until that index is applied before serving the value.
+**Write path:** client → leader HTTP → `propose()` → WAL → `AppendEntries` to peers → quorum ack → apply KV → HTTP 200
 
-Non-leader nodes return `307 Redirect` to the leader's HTTP address (path-preserving), so any node can be addressed by a client.
+**Read path:** client → leader HTTP → capture `commit_index` → wait until applied → read KV → HTTP 200
 
-## Crates
+**Non-leader:** any node receiving a client request returns `307 Redirect` to the leader's HTTP address.
 
-| Crate | Role |
-|---|---|
-| `raft` | Pure Raft state machine — no I/O, no async |
-| `storage` | Write-Ahead Log (WAL) + KV state machine |
-| `server` | Axum HTTP API + tonic gRPC peer RPCs + Raft driver |
-| `client` | CLI tool (`raft-kv-cli`) |
+---
+
+## Crate layout
+
+```
+raft-kv/
+├── crates/
+│   ├── raft/      Pure state machine — no I/O, no async. step(Message) → Ready.
+│   ├── storage/   WAL (CRC32 + JSON records) + in-memory KV (BTreeMap).
+│   ├── server/    axum HTTP + tonic gRPC + NodeHandle driving the SM.
+│   └── client/    CLI: raft-kv-cli set/get/delete/status/scan.
+└── scripts/
+    └── integration_test.sh   End-to-end cluster tests + chaos scenarios.
+```
 
 ### `crates/raft` — The algorithm
 
-The Raft state machine is intentionally pure: it takes a `Message` in and returns a `Ready` struct out. No network calls, no disk I/O, no async. This makes it trivially unit-testable.
+The state machine is a pure function: no network, no disk, no async.
 
-```
-node.step(Message::Tick)           → Ready { messages, entries_to_persist, entries_to_apply }
-node.step(Message::Propose { .. }) → Ready { .. }
-node.step(Message::AppendEntries)  → Ready { .. }
-```
-
-The caller (`NodeHandle`) is responsible for acting on `Ready`:
-1. Persist `entries_to_persist` to WAL before sending any messages
-2. Apply `entries_to_apply` to the KV state machine
-3. Fan out `messages` to peer nodes via gRPC
-
-### `crates/storage`
-
-**WAL record format** (binary, little-endian):
-```
-[4 bytes] payload length (u32)
-[4 bytes] CRC32 checksum
-[N bytes] JSON-encoded WalRecord (HardState | Entry | Snapshot)
+```rust
+let ready = node.step(Message::AppendEntries { from, msg });
+// ready.messages          → RPCs to send
+// ready.entries_to_persist → write to WAL before replying
+// ready.entries_to_apply   → apply to KV state machine
+// ready.membership_change  → add/remove peer connection
 ```
 
-Records with invalid checksums are discarded during recovery (truncated tail). The WAL is append-only and fsynced on every write.
+`NodeHandle` (in `server`) is the only component that does I/O — it owns the WAL, the KV store, the gRPC clients, and the tick loop.
 
-**KvStore** is an in-memory `BTreeMap<String, String>`. Commands (`Set` / `Delete`) are JSON-encoded and stored as the `command` field of each `LogEntry`.
+### WAL record format
 
-### `crates/server`
+```
+┌──────────┬──────────┬──────────────────────────────┐
+│  length  │  CRC32   │  JSON payload (WalRecord)    │
+│  4 bytes │  4 bytes │  N bytes                     │
+└──────────┴──────────┴──────────────────────────────┘
+```
 
-The server binary drives the Raft state machine from a tokio event loop:
+Records with invalid checksums are silently dropped on replay (truncated-tail recovery). The WAL is fsynced on every append.
 
-- **Tick loop**: calls `node.step(Tick)` every 10ms to advance election and heartbeat timers.
-- **gRPC server** (`tonic`): receives `RequestVote` and `AppendEntries` RPCs from peers.
-- **gRPC client** (`peer.rs`): sends Raft messages to each peer node.
-- **HTTP server** (`axum`): exposes the KV API to clients.
+---
 
-### `crates/client`
+## Quick start
+
+**Prerequisites**
 
 ```bash
-raft-kv-cli --addr http://127.0.0.1:8001 set foo bar
-raft-kv-cli --addr http://127.0.0.1:8001 get foo
-raft-kv-cli --addr http://127.0.0.1:8001 delete foo
-raft-kv-cli --addr http://127.0.0.1:8001 status
-```
-
-## Running a cluster
-
-```bash
-# Build
-cargo build
-
-# Start 3 nodes in separate terminals
-make node1
-make node2
-make node3
-```
-
-Or manually:
-```bash
-# --peer        id=grpc_addr   — used for Raft peer RPCs
-# --http-peer   id=http_addr   — used to redirect clients to the leader
-RUST_LOG=info cargo run -p server -- \
-  --id 1 \
-  --grpc-addr 127.0.0.1:7001 --http-addr 127.0.0.1:8001 \
-  --peer 2=127.0.0.1:7002 --peer 3=127.0.0.1:7003 \
-  --http-peer 2=127.0.0.1:8002 --http-peer 3=127.0.0.1:8003
-
-# In another terminal
-raft-kv-cli set hello world
-raft-kv-cli get hello   # → world
-
-# Prometheus metrics
-curl http://127.0.0.1:8001/metrics
-```
-
-## Prerequisites
-
-```bash
-# Rust stable
-curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh
-
+rustup update stable
 # protoc (for tonic gRPC codegen)
 # Arch:   sudo pacman -S protobuf
 # Debian: sudo apt install protobuf-compiler
 # macOS:  brew install protobuf
 ```
 
-## Stack
+**Run a 3-node cluster** (three terminals)
 
-| Layer | Technology |
-|---|---|
-| Consensus | Raft (from scratch — no raft-rs) |
-| gRPC | tonic 0.12 + prost 0.13 |
-| HTTP | axum 0.8 |
-| Async | tokio |
-| Persistence | Custom WAL (CRC32 + JSON) |
-| Serialization | serde_json (WAL), prost (gRPC) |
-| Observability | prometheus 0.13 |
+```bash
+cargo build
+make node1   # id=1, gRPC :7001, HTTP :8001
+make node2   # id=2, gRPC :7002, HTTP :8002
+make node3   # id=3, gRPC :7003, HTTP :8003
+```
+
+**Use the CLI**
+
+```bash
+cargo run -p client -- set hello world
+cargo run -p client -- get hello          # → world
+cargo run -p client -- scan --prefix ""   # → all keys
+cargo run -p client -- delete hello
+cargo run -p client -- status
+```
+
+**Or raw HTTP**
+
+```bash
+curl -X PUT  http://127.0.0.1:8001/kv/city -d "monterrey"
+curl          http://127.0.0.1:8001/kv/city          # → monterrey
+curl          http://127.0.0.1:8001/kv?prefix=c       # → {"city":"monterrey"}
+curl -X DELETE http://127.0.0.1:8001/kv/city
+curl          http://127.0.0.1:8001/status
+curl          http://127.0.0.1:8001/metrics
+```
+
+**Membership changes**
+
+```bash
+# Add a fourth node (started with --learner)
+curl -X POST http://127.0.0.1:8001/cluster/add \
+  -H "Content-Type: application/json" \
+  -d '{"id":4,"raft_addr":"127.0.0.1:7004","http_addr":"127.0.0.1:8004"}'
+
+# Remove it
+curl -X POST http://127.0.0.1:8001/cluster/remove \
+  -H "Content-Type: application/json" \
+  -d '{"id":4}'
+```
+
+**Run all tests**
+
+```bash
+make test                 # 28 unit tests
+make integration-test     # full cluster + chaos + membership
+```
+
+---
+
+## HTTP API
+
+| Method | Path | Body | Description |
+|--------|------|------|-------------|
+| `GET` | `/kv/{key}` | — | Get a value (linearizable) |
+| `PUT` | `/kv/{key}` | plain text | Set a value |
+| `DELETE` | `/kv/{key}` | — | Delete a key |
+| `GET` | `/kv?prefix={p}` | — | Scan all keys with prefix (JSON map) |
+| `GET` | `/status` | — | Node status (is_leader, leader_id) |
+| `GET` | `/metrics` | — | Prometheus metrics |
+| `POST` | `/cluster/add` | JSON | Add a node to the cluster |
+| `POST` | `/cluster/remove` | JSON | Remove a node from the cluster |
+
+Non-leader nodes return `307 Temporary Redirect` to the leader for all write endpoints and `/kv` reads.
 
 ---
 
 ## What's implemented
 
+**Raft core**
 - [x] Leader election with randomized timeouts
-- [x] Log replication (AppendEntries)
-- [x] Commit index advancement (quorum-based)
-- [x] No-op entry on leader election (fixes stale commit index)
-- [x] Fast log rollback on conflict
-- [x] Log compaction with WAL snapshot record
-- [x] Write-Ahead Log with CRC32 integrity check
-- [x] WAL replay on startup (term, voted_for, log entries, snapshot)
-- [x] KV state machine (`set` / `delete`)
-- [x] HTTP API with linearizable ReadIndex reads
-- [x] Path-preserving `307 Redirect` on non-leader nodes (`--http-peer` flag)
-- [x] gRPC peer communication (tonic) with full response routing
-- [x] Snapshot transfer via `InstallSnapshot` RPC
-- [x] CLI client
-- [x] Unit tests — 15 for `raft` SM, 13 for `server` (WAL replay, proposals, ReadIndex)
-- [x] Integration + chaos tests (15/15): election, writes, failover, write-during-kill, WAL replay, minority partition
-- [x] Prometheus metrics at `GET /metrics` — counters, gauges, histograms
+- [x] Log replication (`AppendEntries`) with fast conflict rollback
+- [x] Quorum-based commit index advancement
+- [x] No-op entry on leader win (fixes stale commit index from previous terms)
+- [x] Log compaction + WAL snapshot record
+- [x] `InstallSnapshot` RPC for lagging peers
+- [x] Membership changes — add/remove nodes at runtime (single-server changes, pending-conf-change guard)
+- [x] Learner mode (`--learner`) — node joins without voting until `ConfChange(Add)` commits
 
-## Next steps
+**Storage**
+- [x] Append-only WAL with CRC32 per record
+- [x] WAL replay on startup (HardState, log entries, snapshot)
+- [x] In-memory KV (`BTreeMap`) with `set` / `delete` / `scan_prefix`
+- [x] Snapshot serialization (serde_json of the BTreeMap)
 
-- [ ] **Membership changes** — add/remove nodes from a running cluster (joint consensus)
+**Server**
+- [x] Linearizable reads via ReadIndex protocol
+- [x] `307 Redirect` on non-leader nodes (path-preserving)
+- [x] Prefix scan endpoint (`GET /kv?prefix=`)
+- [x] gRPC peer server + client (tonic 0.12)
+- [x] `entry_type` propagated over the wire (Normal vs ConfChange)
+- [x] Prometheus metrics — term, commit index, applied index, read/write counters, latency histograms
+
+**Tests**
+- [x] 15 unit tests — pure Raft SM (election, replication, conflict, snapshot, term monotonicity)
+- [x] 13 unit tests — server layer (WAL replay, proposals, ReadIndex, drain on leadership loss)
+- [x] Integration + chaos tests: initial election, writes, follower redirect, leader failover, write-during-kill, WAL replay & catchup, minority partition & heal, membership add/remove
+
+---
+
+## Stack
+
+| Layer | Crate |
+|-------|-------|
+| Consensus | hand-rolled (no `raft-rs`) |
+| HTTP | `axum` 0.8 |
+| gRPC | `tonic` 0.12 + `prost` 0.13 |
+| Async runtime | `tokio` |
+| Serialization | `serde_json` (WAL + commands), `prost` (wire) |
+| Observability | `prometheus` 0.13 |
+| CLI | `clap` 4 |
+
+---
+
+## Design notes
+
+**Why a pure state machine?**
+Separating the Raft algorithm from I/O makes it trivially unit-testable: every test drives the SM with hand-crafted `Message`s and asserts on the returned `Ready` struct — no network mocking required.
+
+**Why a custom WAL instead of RocksDB?**
+Keeps the dependency tree minimal and the code readable. The WAL is ~60 lines and the recovery logic is ~30 lines. The tradeoff is no compaction of the WAL file itself (only Raft log compaction via snapshots).
+
+**Membership changes strategy**
+Single-server changes (one node at a time) with a `pending_conf_change` guard to prevent concurrent changes. New nodes start as learners: the leader replicates to them immediately but they don't count toward quorum until their `ConfChange(Add)` commits.
