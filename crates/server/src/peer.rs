@@ -1,7 +1,7 @@
 /// gRPC client for sending Raft RPCs to a peer node.
 use raft::{
     message::{
-        AppendEntries, AppendEntriesResponse, InstallSnapshotResponse, NodeId,
+        AppendEntries, AppendEntriesResponse, EntryType, InstallSnapshotResponse, NodeId,
         RequestVote, RequestVoteResponse, Snapshot,
     },
     Message,
@@ -23,7 +23,10 @@ pub struct PeerClient {
 
 impl PeerClient {
     pub fn new(id: NodeId, addr: String) -> Self {
-        Self { id, addr: format!("http://{addr}") }
+        Self {
+            id,
+            addr: format!("http://{addr}"),
+        }
     }
 
     /// Send a Raft RPC to this peer and return the response as a Message,
@@ -36,7 +39,11 @@ impl PeerClient {
         }
     }
 
-    pub async fn send_install_snapshot(&self, leader_term: u64, snapshot: Snapshot) -> Option<Message> {
+    pub async fn send_install_snapshot(
+        &self,
+        leader_term: u64,
+        snapshot: Snapshot,
+    ) -> Option<Message> {
         let Ok(mut client) = RaftServiceClient::connect(self.addr.clone()).await else {
             warn!(peer = self.id, "failed to connect for InstallSnapshot");
             return None;
@@ -46,14 +53,17 @@ impl PeerClient {
             leader_id: self.id,
             last_index: snapshot.last_index,
             last_term: snapshot.last_term,
-            data: snapshot.data.into(),
+            data: snapshot.data,
         };
         match client.install_snapshot(req).await {
             Ok(resp) => {
                 let r = resp.into_inner();
                 Some(Message::InstallSnapshotResponse {
                     from: self.id,
-                    msg: InstallSnapshotResponse { term: r.term, success: r.success },
+                    msg: InstallSnapshotResponse {
+                        term: r.term,
+                        success: r.success,
+                    },
                 })
             }
             Err(e) => {
@@ -79,7 +89,10 @@ impl PeerClient {
                 let r = resp.into_inner();
                 Some(Message::RequestVoteResponse {
                     from: self.id,
-                    msg: RequestVoteResponse { term: r.term, vote_granted: r.vote_granted },
+                    msg: RequestVoteResponse {
+                        term: r.term,
+                        vote_granted: r.vote_granted,
+                    },
                 })
             }
             Err(e) => {
@@ -97,7 +110,16 @@ impl PeerClient {
         let entries = msg
             .entries
             .into_iter()
-            .map(|e| proto::LogEntry { index: e.index, term: e.term, command: e.command.into() })
+            .map(|e| proto::LogEntry {
+                index: e.index,
+                term: e.term,
+                command: e.command,
+                entry_type: if e.entry_type == EntryType::ConfChange {
+                    1
+                } else {
+                    0
+                },
+            })
             .collect();
         let req = proto::AppendEntriesRequest {
             term: msg.term,

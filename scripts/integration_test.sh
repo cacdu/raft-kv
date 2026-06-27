@@ -350,6 +350,76 @@ else
     fi
 fi
 
+# ── membership change: add node 4, write a key, then remove node 4 ──────────
+log "=== Membership change test ==="
+mkdir -p "$DATA/node4"
+
+# Find a leader among the current nodes
+MEMBER_LEADER=$(wait_for_leader)
+if [[ -z "$MEMBER_LEADER" ]]; then
+    fail "membership: no leader before adding node 4"
+else
+    pass "membership: cluster has a leader ($MEMBER_LEADER) before add"
+
+    # Start node 4 as a learner — no peers specified (it doesn't know the cluster yet)
+    log "Membership: starting node 4 as learner..."
+    RUST_LOG=error "$BINARY" \
+        --id 4 \
+        --grpc-addr "127.0.0.1:7004" \
+        --http-addr "127.0.0.1:8004" \
+        --data-dir "$DATA/node4" \
+        --learner &
+    PID4=$!
+
+    sleep 1  # give node 4 time to start
+
+    # Tell the leader to add node 4
+    ADD_RESP=$(curl -sf -X POST "http://127.0.0.1:${MEMBER_LEADER}/cluster/add" \
+        -H "Content-Type: application/json" \
+        -d '{"id":4,"raft_addr":"127.0.0.1:7004","http_addr":"127.0.0.1:8004"}' \
+        -w "%{http_code}" -o /dev/null 2>/dev/null || echo "000")
+    if [[ "$ADD_RESP" == "200" ]]; then
+        pass "membership: node 4 added to cluster (HTTP 200)"
+    else
+        fail "membership: POST /cluster/add returned $ADD_RESP"
+    fi
+
+    sleep 2  # let ConfChange replicate and node 4 catch up
+
+    # Write a key via leader — quorum now requires node 4 if majority is 3/4 → actually still 3 need 3
+    kv_put "$MEMBER_LEADER" "membership_key" "membership_val"
+    VAL=$(kv_get "$MEMBER_LEADER" "membership_key")
+    if [[ "$VAL" == "membership_val" ]]; then
+        pass "membership: write succeeds on 4-node cluster"
+    else
+        fail "membership: write on 4-node cluster returned '$VAL'"
+    fi
+
+    # Remove node 4
+    REMOVE_RESP=$(curl -sf -X POST "http://127.0.0.1:${MEMBER_LEADER}/cluster/remove" \
+        -H "Content-Type: application/json" \
+        -d '{"id":4}' \
+        -w "%{http_code}" -o /dev/null 2>/dev/null || echo "000")
+    if [[ "$REMOVE_RESP" == "200" ]]; then
+        pass "membership: node 4 removed from cluster (HTTP 200)"
+    else
+        fail "membership: POST /cluster/remove returned $REMOVE_RESP"
+    fi
+
+    sleep 1
+
+    # Cluster should still work on 3 nodes after removal
+    kv_put "$MEMBER_LEADER" "after_remove_key" "after_remove_val"
+    VAL=$(kv_get "$MEMBER_LEADER" "after_remove_key")
+    if [[ "$VAL" == "after_remove_val" ]]; then
+        pass "membership: write succeeds after removing node 4"
+    else
+        fail "membership: write after node removal returned '$VAL'"
+    fi
+
+    kill "$PID4" 2>/dev/null; wait "$PID4" 2>/dev/null || true
+fi
+
 # ── result ────────────────────────────────────────────────────────────────────
 
 echo ""

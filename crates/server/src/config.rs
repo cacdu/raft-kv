@@ -27,6 +27,11 @@ pub struct NodeConfig {
 
     #[arg(long, default_value = "data")]
     pub data_dir: PathBuf,
+
+    /// Start as a non-voting learner. The cluster leader must issue POST /cluster/add
+    /// with this node's id/addrs before it joins as a full voter.
+    #[arg(long, default_value_t = false)]
+    pub learner: bool,
 }
 
 impl NodeConfig {
@@ -46,4 +51,3 @@ fn parse_peer(s: &str) -> Result<(NodeId, String), String> {
     let id: NodeId = id.parse().map_err(|_| format!("invalid node id: {id}"))?;
     Ok((id, addr.to_string()))
 }
-

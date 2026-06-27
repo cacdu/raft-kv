@@ -38,8 +38,24 @@ async fn main() -> Result<()> {
     // ── Raft node ────────────────────────────────────────────────────────────
     let peers_map = cfg.peers_map();
     let raft_config = raft::Config::new(cfg.id, peers_map.keys().copied().collect());
-    let handle = Arc::new(NodeHandle::new(raft_config, records, Arc::clone(&kv), Arc::clone(&wal)));
-    handle.register_peers(peers_map.clone()).await;
+    let handle = if cfg.learner {
+        Arc::new(NodeHandle::new_learner(
+            raft_config,
+            records,
+            Arc::clone(&kv),
+            Arc::clone(&wal),
+        ))
+    } else {
+        Arc::new(NodeHandle::new(
+            raft_config,
+            records,
+            Arc::clone(&kv),
+            Arc::clone(&wal),
+        ))
+    };
+    handle
+        .register_peers(peers_map.clone(), cfg.http_peers_map())
+        .await;
 
     // ── gRPC peer server ─────────────────────────────────────────────────────
     let grpc_addr: SocketAddr = cfg.grpc_addr.parse()?;
@@ -47,8 +63,7 @@ async fn main() -> Result<()> {
 
     // ── HTTP client API ──────────────────────────────────────────────────────
     let http_addr: SocketAddr = cfg.http_addr.parse()?;
-    let http_peers_map = cfg.http_peers_map();
-    let http_router = http::router(Arc::clone(&handle), Arc::clone(&kv), http_peers_map);
+    let http_router = http::router(Arc::clone(&handle), Arc::clone(&kv));
 
     // ── Raft tick loop ───────────────────────────────────────────────────────
     let tick_handle = Arc::clone(&handle);
@@ -63,14 +78,11 @@ async fn main() -> Result<()> {
     info!("gRPC listening on {grpc_addr}");
     info!("HTTP listening on {http_addr}");
 
-    tokio::try_join!(
-        grpc_server,
-        async move {
-            let listener = tokio::net::TcpListener::bind(http_addr).await?;
-            axum::serve(listener, http_router).await?;
-            Ok::<_, anyhow::Error>(())
-        }
-    )?;
+    tokio::try_join!(grpc_server, async move {
+        let listener = tokio::net::TcpListener::bind(http_addr).await?;
+        axum::serve(listener, http_router).await?;
+        Ok::<_, anyhow::Error>(())
+    })?;
 
     Ok(())
 }
