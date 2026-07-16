@@ -1,7 +1,12 @@
 [package]
 name = "storage"
-version = "0.1.0"
-edition = "2021"
+description = "Durable append-only WAL (CRC32-checked) and in-memory KV store for raft-kv"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+authors.workspace = true
+repository.workspace = true
+rust-version.workspace = true
 
 [dependencies]
 raft = { path = "../raft" }

@@ -1,7 +1,12 @@
 [package]
 name = "client"
-version = "0.1.0"
-edition = "2021"
+description = "raft-kv-cli: a small HTTP command-line client for a raft-kv cluster"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+authors.workspace = true
+repository.workspace = true
+rust-version.workspace = true
 
 [[bin]]
 name = "raft-kv-cli"
