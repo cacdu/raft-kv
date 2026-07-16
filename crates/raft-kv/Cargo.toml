@@ -1,7 +1,19 @@
 [package]
-name = "server"
-version = "0.1.0"
-edition = "2021"
+name = "raft-kv"
+description = "Embeddable Raft-replicated key-value store: use as a library or run standalone"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+authors.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+readme = "README.md"
+keywords = ["raft", "consensus", "distributed", "database", "kv-store"]
+categories = ["database-implementations", "network-programming", "concurrency"]
+
+[lib]
+name = "raft_kv"
+path = "src/lib.rs"
 
 [[bin]]
 name = "raft-kv"

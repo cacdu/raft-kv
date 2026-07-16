@@ -1,4 +1,11 @@
 /// gRPC client for sending Raft RPCs to a peer node.
+///
+/// Each peer gets one lazily-connected channel, created at registration:
+/// tonic reconnects it transparently, and the connect/request timeouts
+/// bound every RPC so a dead peer can never stall the caller. Liveness of
+/// the cluster must not depend on the liveness of any single peer.
+use std::time::Duration;
+
 use raft::{
     message::{
         AppendEntries, AppendEntriesResponse, EntryType, InstallSnapshotResponse, NodeId,
@@ -6,6 +13,7 @@ use raft::{
     },
     Message,
 };
+use tonic::transport::{Channel, Endpoint};
 use tracing::warn;
 
 pub mod proto {
@@ -14,19 +22,28 @@ pub mod proto {
 
 use proto::raft_service_client::RaftServiceClient;
 
+const CONNECT_TIMEOUT: Duration = Duration::from_millis(300);
+/// Generous enough for an InstallSnapshot payload on a LAN.
+const RPC_TIMEOUT: Duration = Duration::from_secs(3);
+
 #[derive(Clone)]
 pub struct PeerClient {
     pub id: NodeId,
-    /// Full HTTP URL: "http://host:port"
-    pub addr: String,
+    channel: Channel,
 }
 
 impl PeerClient {
     pub fn new(id: NodeId, addr: String) -> Self {
-        Self {
-            id,
-            addr: format!("http://{addr}"),
-        }
+        let channel = Endpoint::from_shared(format!("http://{addr}"))
+            .expect("peer address must form a valid URI")
+            .connect_timeout(CONNECT_TIMEOUT)
+            .timeout(RPC_TIMEOUT)
+            .connect_lazy();
+        Self { id, channel }
+    }
+
+    fn client(&self) -> RaftServiceClient<Channel> {
+        RaftServiceClient::new(self.channel.clone())
     }
 
     /// Send a Raft RPC to this peer and return the response as a Message,
@@ -44,10 +61,6 @@ impl PeerClient {
         leader_term: u64,
         snapshot: Snapshot,
     ) -> Option<Message> {
-        let Ok(mut client) = RaftServiceClient::connect(self.addr.clone()).await else {
-            warn!(peer = self.id, "failed to connect for InstallSnapshot");
-            return None;
-        };
         let req = proto::InstallSnapshotRequest {
             term: leader_term,
             leader_id: self.id,
@@ -55,7 +68,7 @@ impl PeerClient {
             last_term: snapshot.last_term,
             data: snapshot.data,
         };
-        match client.install_snapshot(req).await {
+        match self.client().install_snapshot(req).await {
             Ok(resp) => {
                 let r = resp.into_inner();
                 Some(Message::InstallSnapshotResponse {
@@ -74,17 +87,13 @@ impl PeerClient {
     }
 
     async fn send_request_vote(&self, _from: NodeId, msg: RequestVote) -> Option<Message> {
-        let Ok(mut client) = RaftServiceClient::connect(self.addr.clone()).await else {
-            warn!(peer = self.id, "failed to connect for RequestVote");
-            return None;
-        };
         let req = proto::RequestVoteRequest {
             term: msg.term,
             candidate_id: msg.candidate_id,
             last_log_index: msg.last_log_index,
             last_log_term: msg.last_log_term,
         };
-        match client.request_vote(req).await {
+        match self.client().request_vote(req).await {
             Ok(resp) => {
                 let r = resp.into_inner();
                 Some(Message::RequestVoteResponse {
@@ -103,10 +112,6 @@ impl PeerClient {
     }
 
     async fn send_append_entries(&self, _from: NodeId, msg: AppendEntries) -> Option<Message> {
-        let Ok(mut client) = RaftServiceClient::connect(self.addr.clone()).await else {
-            warn!(peer = self.id, "failed to connect for AppendEntries");
-            return None;
-        };
         let entries = msg
             .entries
             .into_iter()
@@ -129,7 +134,7 @@ impl PeerClient {
             entries,
             leader_commit: msg.leader_commit,
         };
-        match client.append_entries(req).await {
+        match self.client().append_entries(req).await {
             Ok(resp) => {
                 let r = resp.into_inner();
                 Some(Message::AppendEntriesResponse {

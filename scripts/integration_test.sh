@@ -83,7 +83,7 @@ start_node() {
 # ── setup ─────────────────────────────────────────────────────────────────────
 
 log "Building binary..."
-cargo build -p server --quiet
+cargo build -p raft-kv --quiet
 
 log "Cleaning data dir..."
 rm -rf "$DATA"

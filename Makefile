@@ -17,7 +17,7 @@ clean:
 
 node1:
 	mkdir -p $(DATA)/node1
-	RUST_LOG=info $(CARGO) run -p server -- \
+	RUST_LOG=info $(CARGO) run -p raft-kv -- \
 		--id 1 \
 		--grpc-addr 127.0.0.1:7001 \
 		--http-addr 127.0.0.1:8001 \
@@ -27,7 +27,7 @@ node1:
 
 node2:
 	mkdir -p $(DATA)/node2
-	RUST_LOG=info $(CARGO) run -p server -- \
+	RUST_LOG=info $(CARGO) run -p raft-kv -- \
 		--id 2 \
 		--grpc-addr 127.0.0.1:7002 \
 		--http-addr 127.0.0.1:8002 \
@@ -37,7 +37,7 @@ node2:
 
 node3:
 	mkdir -p $(DATA)/node3
-	RUST_LOG=info $(CARGO) run -p server -- \
+	RUST_LOG=info $(CARGO) run -p raft-kv -- \
 		--id 3 \
 		--grpc-addr 127.0.0.1:7003 \
 		--http-addr 127.0.0.1:8003 \

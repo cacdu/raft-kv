@@ -1225,6 +1225,30 @@ dependencies = [
 ]
 
 [[package]]
+name = "raft-kv"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "axum 0.8.9",
+ "clap",
+ "prometheus",
+ "prost",
+ "raft",
+ "serde",
+ "serde_json",
+ "storage",
+ "tempfile",
+ "thiserror 2.0.18",
+ "tokio",
+ "tonic",
+ "tonic-build",
+ "tower 0.5.3",
+ "tower-http",
+ "tracing",
+ "tracing-subscriber",
+]
+
+[[package]]
 name = "rand"
 version = "0.8.6"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1535,30 +1559,6 @@ dependencies = [
  "itoa",
  "ryu",
  "serde",
-]
-
-[[package]]
-name = "server"
-version = "0.1.0"
-dependencies = [
- "anyhow",
- "axum 0.8.9",
- "clap",
- "prometheus",
- "prost",
- "raft",
- "serde",
- "serde_json",
- "storage",
- "tempfile",
- "thiserror 2.0.18",
- "tokio",
- "tonic",
- "tonic-build",
- "tower 0.5.3",
- "tower-http",
- "tracing",
- "tracing-subscriber",
 ]
 
 [[package]]

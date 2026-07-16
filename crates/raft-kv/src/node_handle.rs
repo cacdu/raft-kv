@@ -3,17 +3,23 @@
 /// - provides async methods for the gRPC and HTTP layers
 use std::{collections::HashMap, sync::Arc};
 
-use tokio::sync::{oneshot, watch, Mutex};
+use tokio::sync::{broadcast, oneshot, watch, Mutex};
 use tracing::{debug, warn};
 
 use raft::{
-    ConfChangeCmd, ConfChangeOp, Config, HardState, LogEntry, LogIndex, Message, NodeId, RaftNode,
-    Ready, Snapshot, Term,
+    message::EntryType, ConfChangeCmd, ConfChangeOp, Config, HardState, LogEntry, LogIndex,
+    Message, NodeId, RaftNode, Ready, Snapshot, Term,
 };
+use storage::kv::Command;
 use storage::wal::WalRecord;
 use storage::{KvStore, Wal};
 
+use crate::events::Event;
 use crate::peer::PeerClient;
+
+/// Buffered events per subscriber before a slow receiver starts lagging.
+/// A lagged receiver gets `RecvError::Lagged` and must resync from the store.
+const EVENT_CHANNEL_CAPACITY: usize = 4096;
 
 pub struct NodeHandle {
     node: Mutex<RaftNode>,
@@ -30,6 +36,9 @@ pub struct NodeHandle {
     applied_rx: watch::Receiver<LogIndex>,
     /// Last snapshot taken for this node (used to send to lagging peers).
     last_snapshot: Mutex<Option<Snapshot>>,
+    /// Broadcast channel: every command applied to the KV store, in log order.
+    /// Backs `RaftKv::subscribe` — the embedded-mode watch API.
+    events_tx: broadcast::Sender<Event>,
 }
 
 impl NodeHandle {
@@ -64,6 +73,7 @@ impl NodeHandle {
             node.restore(term, voted_for, snapshot_index, snapshot_term, entries);
         }
         let (applied_tx, applied_rx) = watch::channel(0u64);
+        let (events_tx, _) = broadcast::channel(EVENT_CHANNEL_CAPACITY);
         Self {
             node: Mutex::new(node),
             kv,
@@ -74,6 +84,7 @@ impl NodeHandle {
             applied_tx,
             applied_rx,
             last_snapshot: Mutex::new(None),
+            events_tx,
         }
     }
 
@@ -95,7 +106,7 @@ impl NodeHandle {
     /// Propose a membership change to the cluster.
     /// Returns a receiver that resolves when the entry is committed, or None if not leader.
     pub async fn propose_conf_change(
-        &self,
+        self: &Arc<Self>,
         op: ConfChangeOp,
         node_id: NodeId,
         raft_addr: Option<String>,
@@ -120,7 +131,7 @@ impl NodeHandle {
         Some(rx)
     }
 
-    pub async fn tick(&self) {
+    pub async fn tick(self: &Arc<Self>) {
         let ready = {
             let mut node = self.node.lock().await;
             node.step(Message::Tick)
@@ -143,7 +154,7 @@ impl NodeHandle {
     /// Returns a receiver that resolves when the entry is committed and applied,
     /// or None if this node is not the leader.
     /// Lock order: node → pending_proposals (never reversed elsewhere).
-    pub async fn propose(&self, command: Vec<u8>) -> Option<oneshot::Receiver<()>> {
+    pub async fn propose(self: &Arc<Self>, command: Vec<u8>) -> Option<oneshot::Receiver<()>> {
         let (tx, rx) = oneshot::channel();
         let ready = {
             let mut node = self.node.lock().await;
@@ -183,6 +194,33 @@ impl NodeHandle {
     /// the applied index advances. Clone it per-request — cloning is cheap.
     pub fn subscribe_applied(&self) -> watch::Receiver<LogIndex> {
         self.applied_rx.clone()
+    }
+
+    /// Subscribe to applied KV commands (the embedded watch API).
+    /// Events arrive in log order; all nodes deliver the same sequence.
+    pub fn subscribe_events(&self) -> broadcast::Receiver<Event> {
+        self.events_tx.subscribe()
+    }
+
+    /// Decode an applied entry into an Event and broadcast it.
+    /// No-op entries (empty command) and ConfChanges are not KV writes.
+    fn broadcast_event(&self, entry: &LogEntry) {
+        if entry.entry_type != EntryType::Normal || entry.command.is_empty() {
+            return;
+        }
+        let event = match serde_json::from_slice::<Command>(&entry.command) {
+            Ok(Command::Set { key, value }) => Event::Set { key, value },
+            Ok(Command::Delete { key }) => Event::Delete { key },
+            Err(e) => {
+                warn!(
+                    index = entry.index,
+                    "unparseable command in event stream: {e}"
+                );
+                return;
+            }
+        };
+        // Err means no subscribers — normal when running standalone.
+        let _ = self.events_tx.send(event);
     }
 
     /// Serialize the KV store and compact the Raft log up to `index`.
@@ -251,6 +289,7 @@ impl NodeHandle {
             }
         }
         let _ = self.applied_tx.send(snapshot.last_index);
+        let _ = self.events_tx.send(Event::SnapshotApplied);
         crate::metrics::APPLIED_INDEX.set(snapshot.last_index as f64);
         *self.last_snapshot.lock().await = Some(snapshot);
     }
@@ -316,6 +355,9 @@ impl NodeHandle {
                     }
                 }
             } // kv lock released before notifying — client can read immediately
+            for entry in &ready.entries_to_apply {
+                self.broadcast_event(entry);
+            }
             let mut pending = self.pending_proposals.lock().await;
             for entry in &ready.entries_to_apply {
                 if let Some(tx) = pending.remove(&entry.index) {
@@ -367,9 +409,25 @@ impl NodeHandle {
         }
     }
 
-    async fn process_ready(&self, ready: Ready) {
+    /// Persist durable state synchronously, then hand the network fan-out to a
+    /// background task. The caller (tick loop, propose) must never wait on
+    /// peer I/O: a dead peer would throttle the tick-driven election and
+    /// heartbeat timers of the whole node. Raft tolerates the resulting
+    /// out-of-order/duplicate delivery by design (term and index checks).
+    async fn process_ready(self: &Arc<Self>, ready: Ready) {
         self.persist(&ready).await;
+        if ready.messages.is_empty() && ready.snapshot_to_send.is_empty() {
+            return;
+        }
+        let this = Arc::clone(self);
+        tokio::spawn(async move { this.fan_out(ready).await });
+    }
 
+    /// Send every outgoing message on its own task and step each response the
+    /// moment it arrives. Responses must never wait on each other: an election
+    /// needs only a quorum of votes, so the vote of a live peer must not sit
+    /// behind the connect timeout of a dead one.
+    async fn fan_out(self: Arc<Self>, ready: Ready) {
         // Leader: send snapshots to lagging peers that can't be caught up via AppendEntries.
         if !ready.snapshot_to_send.is_empty() {
             let snap_opt = self.last_snapshot.lock().await.clone();
@@ -389,88 +447,62 @@ impl NodeHandle {
                         index = snap.last_index,
                         "sending snapshot"
                     );
-                    if let Some(resp) = client
-                        .send_install_snapshot(leader_term, snap.clone())
-                        .await
-                    {
-                        let inner = {
-                            let mut node = self.node.lock().await;
-                            node.step(resp)
-                        };
-                        self.persist(&inner).await;
-                    }
+                    let this = Arc::clone(&self);
+                    let snap = snap.clone();
+                    tokio::spawn(async move {
+                        if let Some(resp) = client.send_install_snapshot(leader_term, snap).await {
+                            this.step_and_persist(resp).await;
+                        }
+                    });
                 }
             }
         }
 
-        if ready.messages.is_empty() {
-            return;
-        }
-
-        // Clone peer clients before releasing the lock so we can await I/O without holding it.
-        let sends: Vec<(PeerClient, Message)> = {
-            let peers = self.peers.lock().await;
-            ready
-                .messages
-                .into_iter()
-                .filter_map(|(dest, msg)| peers.get(&dest).cloned().map(|c| (c, msg)))
-                .collect()
-        };
-
-        // Fan out RPCs and collect responses (no lock held during network I/O).
-        let mut responses = Vec::new();
-        for (client, msg) in sends {
+        for (client, msg) in self.clients_for(ready.messages).await {
             debug!(peer = client.id, "sending message");
-            if let Some(resp) = client.send(msg).await {
-                responses.push(resp);
-            }
+            let this = Arc::clone(&self);
+            tokio::spawn(async move {
+                let Some(resp) = client.send(msg).await else {
+                    return;
+                };
+                // Stepping a response can emit follow-up messages — e.g. the
+                // vote that wins an election emits the new leader's first
+                // AppendEntries broadcast. Send those too; *their* responses
+                // only advance commit_index and never generate further RPCs,
+                // so two levels are all it takes.
+                let followups = this.step_and_persist(resp).await;
+                for (client2, msg2) in this.clients_for(followups).await {
+                    debug!(peer = client2.id, "sending message (post-response)");
+                    let this2 = Arc::clone(&this);
+                    tokio::spawn(async move {
+                        if let Some(resp2) = client2.send(msg2).await {
+                            this2.step_and_persist(resp2).await;
+                        }
+                    });
+                }
+            });
         }
+    }
 
-        if responses.is_empty() {
-            return;
-        }
-
-        // Step the SM with all collected responses and persist the resulting state.
-        // Responses can advance commit_index (entries_to_apply) or trigger role changes
-        // (e.g., becoming leader after quorum of votes, which emits AppendEntries).
-        let inner_ready = {
+    /// Step one peer response through the SM, persist and apply its effects,
+    /// and return any messages it produced.
+    async fn step_and_persist(&self, resp: Message) -> Vec<(NodeId, Message)> {
+        let ready = {
             let mut node = self.node.lock().await;
-            let mut combined = Ready::default();
-            for resp in responses {
-                let r = node.step(resp);
-                if r.hard_state.is_some() {
-                    combined.hard_state = r.hard_state;
-                }
-                combined.entries_to_persist.extend(r.entries_to_persist);
-                combined.entries_to_apply.extend(r.entries_to_apply);
-                combined.messages.extend(r.messages);
-                if r.membership_change.is_some() {
-                    combined.membership_change = r.membership_change;
-                }
-            }
-            combined
+            node.step(resp)
         };
+        self.persist(&ready).await;
+        self.drain_if_lost_leadership(&ready).await;
+        ready.messages
+    }
 
-        self.persist(&inner_ready).await;
-        self.drain_if_lost_leadership(&inner_ready).await;
-
-        // Fan out any messages generated by response handling (e.g., new leader's first
-        // AppendEntries broadcast). We don't collect responses from this second level —
-        // AppendEntries responses only advance commit_index, never generate new RPCs.
-        if !inner_ready.messages.is_empty() {
-            let sends2: Vec<(PeerClient, Message)> = {
-                let peers = self.peers.lock().await;
-                inner_ready
-                    .messages
-                    .into_iter()
-                    .filter_map(|(dest, msg)| peers.get(&dest).cloned().map(|c| (c, msg)))
-                    .collect()
-            };
-            for (client, msg) in sends2 {
-                debug!(peer = client.id, "sending message (post-response)");
-                client.send(msg).await;
-            }
-        }
+    /// Resolve destination node ids to peer clients, dropping unknown peers.
+    async fn clients_for(&self, messages: Vec<(NodeId, Message)>) -> Vec<(PeerClient, Message)> {
+        let peers = self.peers.lock().await;
+        messages
+            .into_iter()
+            .filter_map(|(dest, msg)| peers.get(&dest).cloned().map(|c| (c, msg)))
+            .collect()
     }
 }
 
