@@ -7,6 +7,8 @@
 A distributed key-value store built on a from-scratch Raft implementation in Rust.
 Designed as a learning-grade TiKV — minimal, readable, and production-pattern-complete.
 
+Runs standalone as a server, or **embeds as a library** (the rqlite/dqlite model): link `raft-kv` into each replica of your app and get a shared, linearizable KV store with a watch API — no external database. See [gambas](https://github.com/cacdu/gambas), a distributed pixel canvas built exactly that way.
+
 ```
 $ curl -X PUT http://127.0.0.1:8001/kv/hello -d "world"
 $ curl http://127.0.0.1:8002/kv/hello   # any node, redirects to leader
@@ -21,6 +23,7 @@ world
 - **Linearizable reads** — ReadIndex protocol: reads always reflect the latest committed write
 - **Fault tolerance** — cluster stays available as long as a majority is up; minority partitions heal automatically
 - **HTTP API** — `GET`, `PUT`, `DELETE /kv/{key}`, prefix scan `GET /kv?prefix=`, `307 Redirect` from followers to leader
+- **Watch API (embedded)** — `subscribe()` streams every applied write in log order, the same sequence on every node (like etcd watches)
 - **gRPC peer RPCs** — `RequestVote`, `AppendEntries`, `InstallSnapshot` via tonic
 - **Durable WAL** — append-only write-ahead log with CRC32 integrity check; survives crashes
 - **Observability** — Prometheus metrics at `GET /metrics`
@@ -64,7 +67,8 @@ raft-kv/
 ├── crates/
 │   ├── raft/      Pure state machine — no I/O, no async. step(Message) → Ready.
 │   ├── storage/   WAL (CRC32 + JSON records) + in-memory KV (BTreeMap).
-│   ├── server/    axum HTTP + tonic gRPC + NodeHandle driving the SM.
+│   ├── raft-kv/   The embeddable node: RaftKv facade, NodeHandle (I/O driver),
+│   │              axum HTTP + tonic gRPC. Also builds the standalone binary.
 │   └── client/    CLI: raft-kv-cli set/get/delete/status/scan.
 └── scripts/
     └── integration_test.sh   End-to-end cluster tests + chaos scenarios.
@@ -82,7 +86,7 @@ let ready = node.step(Message::AppendEntries { from, msg });
 // ready.membership_change  → add/remove peer connection
 ```
 
-`NodeHandle` (in `server`) is the only component that does I/O — it owns the WAL, the KV store, the gRPC clients, and the tick loop.
+`NodeHandle` (in `raft-kv`) is the only component that does I/O — it owns the WAL, the KV store, the gRPC clients, and the tick loop.
 
 ### WAL record format
 
@@ -96,6 +100,44 @@ let ready = node.step(Message::AppendEntries { from, msg });
 Records with invalid checksums are silently dropped on replay (truncated-tail recovery). The WAL is fsynced on every append.
 
 ---
+
+## Embed it
+
+Add the crate and every replica of your app becomes a Raft node:
+
+```toml
+[dependencies]
+raft-kv = { git = "https://github.com/cacdu/raft-kv" }
+```
+
+```rust
+use raft_kv::{RaftKv, RaftKvOptions, Event};
+
+let node = RaftKv::start(RaftKvOptions {
+    id: 1,
+    raft_addr: "0.0.0.0:7001".into(),                          // gRPC between nodes
+    peers: [(2, "node2:7001".into()), (3, "node3:7001".into())].into(),
+    app_addrs: [(2, "node2:8080".into()), (3, "node3:8080".into())].into(),
+    data_dir: "data".into(),
+    learner: false,
+}).await?;
+
+node.put("hello", "world").await?;     // quorum-committed write (leader only)
+let v = node.get("hello").await?;      // linearizable read (leader only)
+let v = node.get_local("hello").await; // local read (any node)
+
+// Watch every committed write, in log order — same sequence on every node:
+let mut events = node.subscribe();
+while let Ok(event) = events.recv().await {
+    match event {
+        Event::Set { key, value } => { /* push to clients, update caches… */ }
+        Event::Delete { key } => { /* … */ }
+        Event::SnapshotApplied => { /* state replaced wholesale: resync */ }
+    }
+}
+```
+
+On a follower, writes fail with `Error::NotLeader { leader_addr, .. }` carrying the leader's app-level address (from `app_addrs`) so your app can forward the request. [gambas](https://github.com/cacdu/gambas) — a distributed pixel canvas where each web replica embeds a node and streams pixel deltas to browsers over WebSockets — is the reference consumer.
 
 ## Quick start
 
@@ -204,6 +246,8 @@ Non-leader nodes return `307 Temporary Redirect` to the leader for all write end
 - [x] gRPC peer server + client (tonic 0.12)
 - [x] `entry_type` propagated over the wire (Normal vs ConfChange)
 - [x] Prometheus metrics — term, commit index, applied index, read/write counters, latency histograms
+- [x] Embeddable library API (`RaftKv`) — start/put/get/scan + `subscribe()` watch stream
+- [x] Non-blocking fan-out — peer RPCs on background tasks with connect/request timeouts; responses stepped as they arrive, so dead peers never delay elections or commits
 
 **Tests**
 - [x] 15 unit tests — pure Raft SM (election, replication, conflict, snapshot, term monotonicity)
@@ -233,6 +277,9 @@ Separating the Raft algorithm from I/O makes it trivially unit-testable: every t
 
 **Why a custom WAL instead of RocksDB?**
 Keeps the dependency tree minimal and the code readable. The WAL is ~60 lines and the recovery logic is ~30 lines. The tradeoff is no compaction of the WAL file itself (only Raft log compaction via snapshots).
+
+**Why peer responses are stepped as they arrive**
+Network fan-out runs on background tasks, decoupled from the tick loop, and each peer's response is stepped through the SM the moment it lands. Both halves matter and both were found by killing nodes under load: if the tick loop awaits peer I/O, a dead peer throttles the very election timers that should replace it; and if responses are collected before stepping, the vote of a live peer waits on the connect timeout of a dead one. Raft tolerates the resulting out-of-order delivery by design — every message carries the term/index checks needed to reject stale state.
 
 **Membership changes strategy**
 Single-server changes (one node at a time) with a `pending_conf_change` guard to prevent concurrent changes. New nodes start as learners: the leader replicates to them immediately but they don't count toward quorum until their `ConfChange(Add)` commits.
