@@ -71,6 +71,12 @@ impl RaftLog {
         snapshot_term: Term,
         entries: Vec<LogEntry>,
     ) {
+        debug_assert!(
+            entries
+                .first()
+                .map_or(true, |e| e.index == snapshot_index + 1),
+            "restored entries must start right after the snapshot"
+        );
         self.snapshot_index = snapshot_index;
         self.snapshot_term = snapshot_term;
         self.entries = vec![LogEntry {
