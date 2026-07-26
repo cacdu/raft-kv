@@ -66,13 +66,34 @@ impl NodeHandle {
         kv: Arc<Mutex<KvStore>>,
         wal: Arc<Mutex<Wal>>,
     ) -> Self {
+        let mut last_snapshot = None;
+        let mut applied: LogIndex = 0;
         if !records.is_empty() {
             let (term, voted_for) = replay_hard_state(&records);
-            let (snapshot_index, snapshot_term) = replay_snapshot(&records);
-            let entries = replay_entries(&records);
+            let (snapshot_index, snapshot_term, snapshot_data) = replay_snapshot(&records);
+            let entries = replay_entries(&records, snapshot_index);
+            if snapshot_index > 0 {
+                // The entries covered by the snapshot were compacted away and
+                // will never be re-applied: the state machine must be rebuilt
+                // from the snapshot data or those writes are silently lost.
+                // Nothing else can hold the kv lock during construction.
+                let mut kv_guard = kv.try_lock().expect("kv is uncontended during startup");
+                if let Err(e) = kv_guard.restore(&snapshot_data) {
+                    warn!("KV restore from WAL snapshot failed: {e}");
+                }
+                drop(kv_guard);
+                applied = snapshot_index;
+                // Rebuild the leader-side snapshot too, so a restarted leader
+                // can still serve InstallSnapshot to lagging peers.
+                last_snapshot = Some(Snapshot {
+                    last_index: snapshot_index,
+                    last_term: snapshot_term,
+                    data: snapshot_data,
+                });
+            }
             node.restore(term, voted_for, snapshot_index, snapshot_term, entries);
         }
-        let (applied_tx, applied_rx) = watch::channel(0u64);
+        let (applied_tx, applied_rx) = watch::channel(applied);
         let (events_tx, _) = broadcast::channel(EVENT_CHANNEL_CAPACITY);
         Self {
             node: Mutex::new(node),
@@ -83,7 +104,7 @@ impl NodeHandle {
             pending_proposals: Mutex::new(HashMap::new()),
             applied_tx,
             applied_rx,
-            last_snapshot: Mutex::new(None),
+            last_snapshot: Mutex::new(last_snapshot),
             events_tx,
         }
     }
@@ -245,6 +266,7 @@ impl NodeHandle {
             if let Err(e) = wal.append(&WalRecord::Snapshot {
                 last_index,
                 last_term,
+                data: data.clone(),
             }) {
                 warn!("WAL snapshot write failed: {e}");
             }
@@ -284,6 +306,7 @@ impl NodeHandle {
             if let Err(e) = wal.append(&WalRecord::Snapshot {
                 last_index: snapshot.last_index,
                 last_term: snapshot.last_term,
+                data: snapshot.data.clone(),
             }) {
                 warn!("WAL snapshot write failed: {e}");
             }
@@ -527,26 +550,32 @@ fn replay_hard_state(records: &[WalRecord]) -> (Term, Option<NodeId>) {
     (term, voted_for)
 }
 
-fn replay_snapshot(records: &[WalRecord]) -> (LogIndex, Term) {
+fn replay_snapshot(records: &[WalRecord]) -> (LogIndex, Term, Vec<u8>) {
     let mut snapshot_index: LogIndex = 0;
     let mut snapshot_term: Term = 0;
+    let mut snapshot_data: Vec<u8> = Vec::new();
     for r in records {
         if let WalRecord::Snapshot {
             last_index,
             last_term,
+            data,
         } = r
         {
             snapshot_index = *last_index;
             snapshot_term = *last_term;
+            snapshot_data = data.clone();
         }
     }
-    (snapshot_index, snapshot_term)
+    (snapshot_index, snapshot_term, snapshot_data)
 }
 
 /// Rebuild the log entry list from WAL records, handling conflicts:
 /// when a later record appears at an already-seen index, it truncates
 /// forward — matching what `RaftLog::truncate_and_append` does at runtime.
-fn replay_entries(records: &[WalRecord]) -> Vec<LogEntry> {
+/// Entries at or below `snapshot_index` are dropped: they live inside the
+/// snapshot now, and keeping them would desync the log's offset arithmetic
+/// (`RaftLog::restore` seats entries right after the snapshot sentinel).
+fn replay_entries(records: &[WalRecord], snapshot_index: LogIndex) -> Vec<LogEntry> {
     let mut entries: Vec<LogEntry> = Vec::new();
     for r in records {
         if let WalRecord::Entry(e) = r {
@@ -556,6 +585,7 @@ fn replay_entries(records: &[WalRecord]) -> Vec<LogEntry> {
             entries.push(e.clone());
         }
     }
+    entries.retain(|e| e.index > snapshot_index);
     entries
 }
 
@@ -604,7 +634,7 @@ mod tests {
     #[test]
     fn replay_entries_basic_sequence() {
         let records = vec![entry(1, 1), entry(2, 1), entry(3, 1)];
-        let entries = replay_entries(&records);
+        let entries = replay_entries(&records, 0);
         assert_eq!(entries.len(), 3);
         assert_eq!(entries[0].index, 1);
         assert_eq!(entries[2].index, 3);
@@ -620,7 +650,7 @@ mod tests {
             entry(2, 2), // new leader overwrites from index 2
             entry(3, 2),
         ];
-        let entries = replay_entries(&records);
+        let entries = replay_entries(&records, 0);
         assert_eq!(entries.len(), 3);
         assert_eq!(entries[1].index, 2);
         assert_eq!(
@@ -631,22 +661,23 @@ mod tests {
     }
 
     #[test]
-    fn replay_entries_ignores_non_entry_records() {
+    fn replay_entries_drops_entries_covered_by_snapshot() {
         let records = vec![
             hard_state(1, Some(2)),
             entry(1, 1),
             WalRecord::Snapshot {
                 last_index: 5,
                 last_term: 1,
+                data: vec![],
             },
             entry(6, 2),
         ];
-        let entries = replay_entries(&records);
-        // Snapshot records don't filter entries here; that filtering is done in NodeHandle::new
-        // by passing snapshot_index to RaftNode::restore which sets the log base.
-        assert_eq!(entries.len(), 2);
-        assert_eq!(entries[0].index, 1);
-        assert_eq!(entries[1].index, 6);
+        let entries = replay_entries(&records, 5);
+        // Entry 1 lives inside the snapshot (index ≤ 5) and must not resurface —
+        // it would desync the log's offset arithmetic. Entry 6 sits above the
+        // snapshot and stays. Non-entry records are skipped either way.
+        assert_eq!(entries.len(), 1);
+        assert_eq!(entries[0].index, 6);
     }
 
     // ── replay_snapshot ───────────────────────────────────────────────────────
@@ -657,22 +688,26 @@ mod tests {
             WalRecord::Snapshot {
                 last_index: 10,
                 last_term: 2,
+                data: b"old".to_vec(),
             },
             WalRecord::Snapshot {
                 last_index: 20,
                 last_term: 3,
+                data: b"new".to_vec(),
             },
         ];
-        let (idx, term) = replay_snapshot(&records);
+        let (idx, term, data) = replay_snapshot(&records);
         assert_eq!(idx, 20);
         assert_eq!(term, 3);
+        assert_eq!(data, b"new", "the newest snapshot's data must win");
     }
 
     #[test]
     fn replay_snapshot_none_returns_zero() {
-        let (idx, term) = replay_snapshot(&[hard_state(1, None)]);
+        let (idx, term, data) = replay_snapshot(&[hard_state(1, None)]);
         assert_eq!(idx, 0);
         assert_eq!(term, 0);
+        assert!(data.is_empty());
     }
 
     // ── 2.1: pending_proposals ────────────────────────────────────────────────
@@ -825,6 +860,84 @@ mod tests {
             2,
             "applied watch must advance to max applied index"
         );
+    }
+
+    // ── BUG 3: replay after compaction must reconcile entries with the snapshot ─
+    //
+    // The WAL is append-only, so after compacting at index 50 it still holds every
+    // entry 1..=60 plus a Snapshot marker. Two defects on restart:
+    //   1. `replay_entries` returns all 60 entries; `RaftLog::restore` re-inserts
+    //      the ones <= the snapshot base above the sentinel, corrupting the index
+    //      math (last_index / term_at go wrong).
+    //   2. The Snapshot WAL record carried no data, so the KV store was never
+    //      rebuilt — everything committed at or below the snapshot was lost.
+    //
+    // The fix persists the KV bytes in `WalRecord::Snapshot { data }` and filters
+    // replayed entries below the snapshot base. This test pins both: the log must
+    // be correctly indexed, and the KV store must be rehydrated from the snapshot.
+    //
+    // NOTE: written against the post-fix API — `WalRecord::Snapshot` gains `data`.
+    #[test]
+    fn replay_after_compaction_reindexes_log_and_restores_kv() {
+        use std::collections::BTreeMap;
+        use std::sync::Arc;
+        use storage::{KvStore, Wal};
+        use tokio::sync::Mutex;
+
+        // The snapshot at index 50 carries the KV state as serialized bytes,
+        // exactly as `KvStore::snapshot()` produces it (serde_json of the map).
+        let mut map: BTreeMap<String, String> = BTreeMap::new();
+        map.insert("px:001:001".to_string(), "5".to_string());
+        map.insert("px:002:002".to_string(), "9".to_string());
+        let snap_data = serde_json::to_vec(&map).unwrap();
+
+        let mut records: Vec<WalRecord> = (1..=60u64)
+            .map(|i| {
+                WalRecord::Entry(LogEntry {
+                    index: i,
+                    term: 1,
+                    entry_type: EntryType::Normal,
+                    command: vec![],
+                })
+            })
+            .collect();
+        records.push(WalRecord::Snapshot {
+            last_index: 50,
+            last_term: 1,
+            data: snap_data,
+        });
+
+        let cfg = raft::Config::new(1, vec![2, 3]);
+        let tmp = tempfile::NamedTempFile::new().unwrap();
+        let (wal, _) = Wal::open(tmp.path()).unwrap();
+        let kv = Arc::new(Mutex::new(KvStore::default()));
+        let wal = Arc::new(Mutex::new(wal));
+        let handle = NodeHandle::new(cfg, records, kv, wal);
+
+        let rt = tokio::runtime::Runtime::new().unwrap();
+        rt.block_on(async {
+            let node = handle.node.lock().await;
+            assert_eq!(node.log.snapshot_index(), 50, "snapshot base must be 50");
+            assert_eq!(
+                node.log.last_index(),
+                60,
+                "log must end at 60, not snapshot_base + every replayed entry"
+            );
+            assert_eq!(
+                node.log.term_at(60),
+                Some(1),
+                "entry 60 must remain addressable"
+            );
+            drop(node);
+
+            let kv = handle.kv.lock().await;
+            assert_eq!(
+                kv.get("px:001:001"),
+                Some("5"),
+                "KV must be rehydrated from the snapshot data on restart"
+            );
+            assert_eq!(kv.get("px:002:002"), Some("9"));
+        });
     }
 
     fn make_handle(id: u64, peers: Vec<u64>) -> Arc<NodeHandle> {

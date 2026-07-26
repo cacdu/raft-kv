@@ -36,6 +36,11 @@ pub enum WalRecord {
     Snapshot {
         last_index: LogIndex,
         last_term: Term,
+        /// Serialized state machine at `last_index`. Compaction discards the
+        /// entries it covers, so without this the KV store cannot be rebuilt
+        /// on restart. `default` keeps pre-0.1.1 WALs readable.
+        #[serde(default)]
+        data: Vec<u8>,
     },
 }
 
