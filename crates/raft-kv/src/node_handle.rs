@@ -332,18 +332,19 @@ impl NodeHandle {
     }
 
     async fn persist(&self, ready: &Ready) {
-        let needs_wal = ready.hard_state.is_some() || !ready.entries_to_persist.is_empty();
-        if needs_wal {
+        // Batch the whole Ready into one WAL write so a single fsync covers
+        // the HardState and every entry.
+        let mut batch = Vec::new();
+        if let Some(HardState { term, voted_for }) = ready.hard_state {
+            batch.push(WalRecord::HardState { term, voted_for });
+        }
+        for entry in &ready.entries_to_persist {
+            batch.push(WalRecord::Entry(entry.clone()));
+        }
+        if !batch.is_empty() {
             let mut wal = self.wal.lock().await;
-            if let Some(HardState { term, voted_for }) = ready.hard_state {
-                if let Err(e) = wal.append(&WalRecord::HardState { term, voted_for }) {
-                    warn!("WAL HardState write failed: {e}");
-                }
-            }
-            for entry in &ready.entries_to_persist {
-                if let Err(e) = wal.append(&WalRecord::Entry(entry.clone())) {
-                    warn!("WAL entry write failed: {e}");
-                }
+            if let Err(e) = wal.append_batch(&batch) {
+                warn!("WAL write failed: {e}");
             }
         }
         if !ready.entries_to_apply.is_empty() {

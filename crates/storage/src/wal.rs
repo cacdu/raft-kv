@@ -55,7 +55,23 @@ impl Wal {
         Ok((Self { file }, records))
     }
 
+    /// Append a single record and fsync it to disk before returning.
     pub fn append(&mut self, record: &WalRecord) -> Result<(), WalError> {
+        self.write_record(record)?;
+        self.sync()
+    }
+
+    /// Append several records with a single fsync covering all of them.
+    /// Raft only needs durability before the RPC response leaves the node,
+    /// so one fsync can amortize a HardState plus a batch of entries.
+    pub fn append_batch(&mut self, records: &[WalRecord]) -> Result<(), WalError> {
+        for record in records {
+            self.write_record(record)?;
+        }
+        self.sync()
+    }
+
+    fn write_record(&mut self, record: &WalRecord) -> Result<(), WalError> {
         let payload = serde_json::to_vec(record)?;
         let checksum = {
             let mut h = Hasher::new();
@@ -67,7 +83,15 @@ impl Wal {
         self.file.write_all(&len.to_le_bytes())?;
         self.file.write_all(&checksum.to_le_bytes())?;
         self.file.write_all(&payload)?;
-        self.file.flush()?;
+        Ok(())
+    }
+
+    /// Force written records to durable storage. `File::flush` is a no-op for
+    /// `std::fs::File` — the bytes sit in the kernel page cache. Raft safety
+    /// depends on a granted vote or an acked entry surviving power loss, and
+    /// only fdatasync provides that guarantee.
+    fn sync(&mut self) -> Result<(), WalError> {
+        self.file.sync_data()?;
         Ok(())
     }
 
@@ -105,5 +129,80 @@ impl Wal {
         }
 
         Ok(records)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use raft::message::{EntryType, LogEntry};
+
+    // ── BUG 2: WAL appends must be crash-durable, and batched ─────────────────
+    //
+    // The old `append` called `File::flush()` — a no-op for std::fs::File: the
+    // record reaches the OS page cache but not the platter. Raft safety requires
+    // HardState and log entries to be durable *before* an RPC is answered; a power
+    // loss between the write and the (missing) fsync can make a node vote twice in
+    // one term → split brain. The fix persists a whole Ready's records via
+    // `append_batch`, fsyncing once before returning.
+    //
+    // NOTE: true crash-durability (surviving a power cut between write and fsync)
+    // cannot be observed by an in-process test — it needs a fault-injection harness
+    // that kills the process and reopens the file. This test pins the round-trip
+    // contract of the batch API the fix introduces; the fsync itself is verified by
+    // inspection of `append_batch`.
+    #[test]
+    fn append_batch_round_trips_all_records() {
+        let tmp = tempfile::NamedTempFile::new().unwrap();
+
+        let batch = vec![
+            WalRecord::HardState {
+                term: 7,
+                voted_for: Some(2),
+            },
+            WalRecord::Entry(LogEntry {
+                index: 1,
+                term: 7,
+                entry_type: EntryType::Normal,
+                command: b"set a 1".to_vec(),
+            }),
+            WalRecord::Entry(LogEntry {
+                index: 2,
+                term: 7,
+                entry_type: EntryType::Normal,
+                command: b"set b 2".to_vec(),
+            }),
+        ];
+
+        {
+            let (mut wal, existing) = Wal::open(tmp.path()).unwrap();
+            assert!(existing.is_empty(), "a fresh WAL starts empty");
+            wal.append_batch(&batch).unwrap();
+        } // drop the handle to be sure nothing lingers only in this process
+
+        // Reopen from disk: every record must be recovered, in order.
+        let (_wal, recovered) = Wal::open(tmp.path()).unwrap();
+        assert_eq!(
+            recovered.len(),
+            3,
+            "all batched records must survive a reopen"
+        );
+        assert!(
+            matches!(
+                recovered[0],
+                WalRecord::HardState {
+                    term: 7,
+                    voted_for: Some(2)
+                }
+            ),
+            "HardState must round-trip"
+        );
+        match &recovered[1] {
+            WalRecord::Entry(e) => {
+                assert_eq!(e.index, 1);
+                assert_eq!(e.term, 7);
+            }
+            other => panic!("expected an Entry at position 1, got {other:?}"),
+        }
     }
 }

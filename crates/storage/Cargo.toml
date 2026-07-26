@@ -17,3 +17,6 @@ thiserror = { workspace = true }
 tracing = { workspace = true }
 crc32fast = { workspace = true }
 bytes = { workspace = true }
+
+[dev-dependencies]
+tempfile = { workspace = true }
