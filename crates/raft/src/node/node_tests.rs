@@ -474,3 +474,81 @@ fn test_leader_appends_noop_on_becoming_leader() {
         "no-op must carry the current term"
     );
 }
+
+// ── BUG 1: a stale/duplicate AppendEntries must not truncate committed entries ─
+//
+// Complements `test_log_rollback_on_conflict` (which checks the *conflict* case).
+// Here the incoming entries already match what the follower holds — a delayed
+// duplicate that only carries the prefix [1,2]. Raft §5.3: entries that already
+// match must NOT be deleted; only the first *conflicting* entry (and everything
+// after it) is truncated. The current code truncates unconditionally from
+// entries[0].index, silently discarding already-committed entries 3, 4 and 5.
+#[test]
+fn stale_append_entries_must_not_truncate_committed_prefix() {
+    let mut n = node(2, vec![1, 3]);
+
+    // Leader (term 1) replicates and commits five entries.
+    let entries: Vec<LogEntry> = (1..=5)
+        .map(|i| LogEntry {
+            index: i,
+            term: 1,
+            entry_type: EntryType::Normal,
+            command: format!("set k{i} {i}").into_bytes(),
+        })
+        .collect();
+    n.step(Message::AppendEntries {
+        from: 1,
+        msg: AppendEntries {
+            term: 1,
+            leader_id: 1,
+            prev_log_index: 0,
+            prev_log_term: 0,
+            entries,
+            leader_commit: 5,
+        },
+    });
+    assert_eq!(
+        n.log.last_index(),
+        5,
+        "precondition: all five entries present"
+    );
+    assert_eq!(n.commit_index, 5, "precondition: entries are committed");
+
+    // A delayed duplicate arrives carrying only the already-present prefix [1,2]
+    // (e.g. an old in-flight AppendEntries clamped by max_entries_per_append).
+    n.step(Message::AppendEntries {
+        from: 1,
+        msg: AppendEntries {
+            term: 1,
+            leader_id: 1,
+            prev_log_index: 0,
+            prev_log_term: 0,
+            entries: vec![
+                LogEntry {
+                    index: 1,
+                    term: 1,
+                    entry_type: EntryType::Normal,
+                    command: b"set k1 1".to_vec(),
+                },
+                LogEntry {
+                    index: 2,
+                    term: 1,
+                    entry_type: EntryType::Normal,
+                    command: b"set k2 2".to_vec(),
+                },
+            ],
+            leader_commit: 5,
+        },
+    });
+
+    assert_eq!(
+        n.log.last_index(),
+        5,
+        "committed entries 3,4,5 must survive a duplicate that carries only the prefix"
+    );
+    assert_eq!(
+        n.log.term_at(5),
+        Some(1),
+        "entry 5 must remain addressable after the duplicate"
+    );
+}

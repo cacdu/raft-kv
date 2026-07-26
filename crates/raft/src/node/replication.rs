@@ -190,11 +190,20 @@ impl RaftNode {
             return;
         }
 
-        // Append new entries (truncating conflicts)
-        if !msg.entries.is_empty() {
-            let first = msg.entries[0].index;
-            self.log.truncate_and_append(first, msg.entries.clone());
-            self.pending_ready.entries_to_persist.extend(msg.entries);
+        // Append new entries (Raft §5.3): skip entries already in the log with
+        // a matching term and truncate only at the first real conflict. A
+        // duplicate or reordered AppendEntries — which the async fan-out
+        // allows — must never erase entries a newer message already appended:
+        // those may be committed, and truncating them would lose data.
+        let first_conflict = msg.entries.iter().position(|e| {
+            e.index > self.log.snapshot_index() && self.log.term_at(e.index) != Some(e.term)
+        });
+        if let Some(i) = first_conflict {
+            let mut entries = msg.entries;
+            let new_entries = entries.split_off(i);
+            let first = new_entries[0].index;
+            self.log.truncate_and_append(first, new_entries.clone());
+            self.pending_ready.entries_to_persist.extend(new_entries);
         }
 
         // Advance commit index
