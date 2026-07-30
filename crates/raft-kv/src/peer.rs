@@ -22,7 +22,9 @@ pub mod proto {
 
 use proto::raft_service_client::RaftServiceClient;
 
-const CONNECT_TIMEOUT: Duration = Duration::from_millis(300);
+/// Generous enough for the TCP + HTTP/2 handshake across regions (a WAN RTT
+/// plus jitter), not just a LAN.
+const CONNECT_TIMEOUT: Duration = Duration::from_secs(1);
 /// Generous enough for an InstallSnapshot payload on a LAN.
 const RPC_TIMEOUT: Duration = Duration::from_secs(3);
 
