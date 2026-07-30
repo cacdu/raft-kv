@@ -681,6 +681,13 @@ mod tests {
     }
 
     // ── replay_snapshot ───────────────────────────────────────────────────────
+    //
+    // Since 0.1.1 (BUG 3 fix) `WalRecord::Snapshot` also carries the serialized
+    // state machine in `data`, and `replay_snapshot` returns it as the third
+    // tuple element. That data rebuilds the KV store on restart — the entries the
+    // snapshot compacted away are gone, so losing it would silently drop writes.
+    // These two tests pin that contract: the newest snapshot's data wins, and a
+    // WAL with no snapshot yields empty data (index/term 0).
 
     #[test]
     fn replay_snapshot_returns_last() {

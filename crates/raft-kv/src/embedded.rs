@@ -30,6 +30,13 @@ pub struct RaftKvOptions {
     pub data_dir: PathBuf,
     /// Start as a non-voting learner (join via a ConfChange on the leader).
     pub learner: bool,
+    /// Ticks before a follower starts an election (the tick loop runs at 10ms).
+    /// `0` keeps the built-in default (10 ticks). Raise it well above the
+    /// inter-node round-trip time to avoid spurious elections on a WAN.
+    pub election_timeout: u32,
+    /// Ticks between leader heartbeats (10ms per tick). Must be `<<` the
+    /// election timeout. `0` keeps the built-in default (3 ticks).
+    pub heartbeat_timeout: u32,
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -75,7 +82,12 @@ impl RaftKv {
         let wal = Arc::new(Mutex::new(wal));
         let kv = Arc::new(Mutex::new(KvStore::default()));
 
-        let raft_config = raft::Config::new(opts.id, opts.peers.keys().copied().collect());
+        let raft_config = build_raft_config(
+            opts.id,
+            opts.peers.keys().copied().collect(),
+            opts.election_timeout,
+            opts.heartbeat_timeout,
+        );
         let handle = if opts.learner {
             Arc::new(NodeHandle::new_learner(
                 raft_config,
@@ -242,5 +254,53 @@ impl RaftKv {
             Some(id) => self.handle.http_peers.lock().await.get(&id).cloned(),
             None => None,
         }
+    }
+}
+
+/// Build the Raft config, overriding the election/heartbeat timeouts only when
+/// the caller supplies a non-zero value. `0` means "keep the built-in default",
+/// which also avoids the empty `election_timeout..2*election_timeout` range
+/// that a literal `0` would otherwise produce.
+fn build_raft_config(
+    id: NodeId,
+    peers: Vec<NodeId>,
+    election_timeout: u32,
+    heartbeat_timeout: u32,
+) -> raft::Config {
+    let mut cfg = raft::Config::new(id, peers);
+    if election_timeout > 0 {
+        cfg.election_timeout = election_timeout;
+    }
+    if heartbeat_timeout > 0 {
+        cfg.heartbeat_timeout = heartbeat_timeout;
+    }
+    cfg
+}
+
+#[cfg(test)]
+mod tests {
+    use super::build_raft_config;
+
+    #[test]
+    fn nonzero_timeouts_override_the_defaults() {
+        let cfg = build_raft_config(1, vec![2, 3], 200, 25);
+        assert_eq!(cfg.election_timeout, 200);
+        assert_eq!(cfg.heartbeat_timeout, 25);
+    }
+
+    #[test]
+    fn zero_timeouts_keep_the_builtin_defaults() {
+        let default = raft::Config::new(1, vec![2, 3]);
+        let cfg = build_raft_config(1, vec![2, 3], 0, 0);
+        assert_eq!(cfg.election_timeout, default.election_timeout);
+        assert_eq!(cfg.heartbeat_timeout, default.heartbeat_timeout);
+    }
+
+    #[test]
+    fn each_timeout_overrides_independently() {
+        let default = raft::Config::new(1, vec![2, 3]);
+        let cfg = build_raft_config(1, vec![2, 3], 200, 0);
+        assert_eq!(cfg.election_timeout, 200);
+        assert_eq!(cfg.heartbeat_timeout, default.heartbeat_timeout);
     }
 }

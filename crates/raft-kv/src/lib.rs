@@ -18,6 +18,8 @@
 //!     app_addrs: [(2, "127.0.0.1:8002".into()), (3, "127.0.0.1:8003".into())].into(),
 //!     data_dir: "data/node1".into(),
 //!     learner: false,
+//!     election_timeout: 0,   // 0 = built-in default (10 ticks); raise for a WAN
+//!     heartbeat_timeout: 0,  // 0 = built-in default (3 ticks)
 //! })
 //! .await?;
 //!

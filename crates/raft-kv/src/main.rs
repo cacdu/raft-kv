@@ -29,6 +29,8 @@ async fn main() -> Result<()> {
         app_addrs: cfg.http_peers_map(),
         data_dir: cfg.data_dir.clone(),
         learner: cfg.learner,
+        election_timeout: 0,
+        heartbeat_timeout: 0,
     })
     .await?;
 
