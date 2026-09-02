@@ -1,6 +1,9 @@
-use super::{RaftNode, Ready};
+use super::{RaftNode, Ready, Role};
 use crate::config::Config;
-use crate::message::{AppendEntries, EntryType, LogEntry, Message, RequestVote};
+use crate::message::{
+    AppendEntries, AppendEntriesResponse, EntryType, InstallSnapshot, LogEntry, Message, NodeId,
+    RequestVote, Snapshot,
+};
 
 fn node(id: u64, peers: Vec<u64>) -> RaftNode {
     let mut cfg = Config::new(id, peers);
@@ -20,8 +23,10 @@ fn tick_n(node: &mut RaftNode, n: u32) -> Vec<Ready> {
 #[test]
 fn tick_triggers_election_and_emits_hard_state() {
     let mut n = node(1, vec![2, 3]);
-    // election_timeout is randomized in [10, 19], so 20 ticks always fires.
-    let readies = tick_n(&mut n, 20);
+    // Timeout is randomized in [10, 19]. 19 ticks fires exactly one election:
+    // it always fires by tick 19, and a second would need >= 20 ticks (10 to the
+    // first fire + 10 more), so the count here can't be flaky.
+    let readies = tick_n(&mut n, 19);
 
     // Exactly one Ready should carry a HardState (the one where election fired).
     let with_hs: Vec<_> = readies.iter().filter(|r| r.hard_state.is_some()).collect();
@@ -281,8 +286,9 @@ fn run_election() -> (RaftNode, RaftNode) {
     let mut n1 = node(1, vec![2, 3]);
     let mut n2 = node(2, vec![1, 3]);
 
-    // 20 ticks guarantees election fires (timeout randomized in [10, 19]).
-    let readies = tick_n(&mut n1, 20);
+    // 19 ticks fires exactly one election (timeout in [10, 19]): it always fires
+    // by tick 19, and a second needs >= 20 ticks — so n1 can't slip to term 2.
+    let readies = tick_n(&mut n1, 19);
 
     // Find the ready that carries RequestVote messages.
     let election_ready = readies
@@ -292,7 +298,7 @@ fn run_election() -> (RaftNode, RaftNode) {
                 .iter()
                 .any(|(_, m)| matches!(m, Message::RequestVote { .. }))
         })
-        .expect("election must fire within 20 ticks");
+        .expect("election must fire within 19 ticks");
 
     // Deliver RequestVote to n2 and get grant.
     let (_, rv_for_n2) = election_ready
@@ -551,4 +557,195 @@ fn stale_append_entries_must_not_truncate_committed_prefix() {
         Some(1),
         "entry 5 must remain addressable after the duplicate"
     );
+}
+
+// ── Fast-rollback hint & backoff (regression: replication deadlock) ───────
+//
+// A follower that fell behind — or that carries a divergent, uncommitted tail
+// from a stale term — used to report `last_index()` on a failed AppendEntries.
+// The leader treated that as a *floor* for next_index, so it could never back
+// down past the tail and the follower never reconciled. The follower now
+// returns the first index of the conflicting term (floored at its committed
+// prefix), and the leader jumps next_index straight there.
+
+fn entry(index: u64, term: u64) -> LogEntry {
+    LogEntry {
+        index,
+        term,
+        entry_type: EntryType::Normal,
+        command: format!("e{index}").into_bytes(),
+    }
+}
+
+fn failure_hint(ready: &Ready) -> u64 {
+    ready
+        .messages
+        .iter()
+        .find_map(|(_, m)| match m {
+            Message::AppendEntriesResponse { msg, .. } if !msg.success => Some(msg.match_index),
+            _ => None,
+        })
+        .expect("expected a failed AppendEntriesResponse")
+}
+
+#[test]
+fn reject_hint_is_conflict_index_not_last_index() {
+    let mut n = node(2, vec![1, 3]);
+    // Committed prefix 1..=3 @ term 1.
+    for i in 1..=3 {
+        n.log.append(entry(i, 1));
+    }
+    // Divergent, uncommitted tail 4..=8 @ term 5 (left by a stale candidacy).
+    for i in 4..=8 {
+        n.log.append(entry(i, 5));
+    }
+    n.commit_index = 3;
+
+    // Leader (term 6) probes inside the divergent region; prev term won't match.
+    let ready = n.step(Message::AppendEntries {
+        from: 1,
+        msg: AppendEntries {
+            term: 6,
+            leader_id: 1,
+            prev_log_index: 7,
+            prev_log_term: 6,
+            entries: vec![],
+            leader_commit: 3,
+        },
+    });
+
+    let hint = failure_hint(&ready);
+    assert_eq!(
+        hint, 4,
+        "hint must be the first index of the conflicting term (4), floored at commit_index+1"
+    );
+    assert!(
+        hint < n.log.last_index(),
+        "hint ({hint}) must be below last_index ({}) — returning last_index is the deadlock bug",
+        n.log.last_index()
+    );
+    assert!(
+        hint > n.commit_index,
+        "hint must never rewind into the committed prefix"
+    );
+}
+
+#[test]
+fn reject_hint_when_log_too_short() {
+    let mut n = node(2, vec![1, 3]);
+    for i in 1..=3 {
+        n.log.append(entry(i, 1));
+    }
+    n.commit_index = 2;
+
+    // Leader probes far ahead of what the follower has.
+    let ready = n.step(Message::AppendEntries {
+        from: 1,
+        msg: AppendEntries {
+            term: 1,
+            leader_id: 1,
+            prev_log_index: 50,
+            prev_log_term: 1,
+            entries: vec![],
+            leader_commit: 2,
+        },
+    });
+
+    let hint = failure_hint(&ready);
+    assert_eq!(
+        hint,
+        n.log.last_index() + 1,
+        "a too-short follower must ask to resume just past its own tail"
+    );
+}
+
+#[test]
+fn leader_jumps_next_index_to_hint_monotonically() {
+    let (mut n1, _) = run_election(); // n1 leader @ term 1
+    for i in n1.log.last_index() + 1..=20 {
+        n1.log.append(entry(i, 1));
+    }
+    // Simulate having probed peer 2 near the tip.
+    if let Role::Leader { next_index, .. } = &mut n1.role {
+        next_index.insert(2, 21);
+    }
+
+    // A failure carrying hint=4 must jump next_index straight to 4.
+    n1.step(Message::AppendEntriesResponse {
+        from: 2,
+        msg: AppendEntriesResponse {
+            term: 1,
+            success: false,
+            match_index: 4,
+        },
+    });
+    let ni = match &n1.role {
+        Role::Leader { next_index, .. } => next_index[&2],
+        _ => panic!("n1 must still be leader"),
+    };
+    assert_eq!(
+        ni, 4,
+        "next_index must jump to the hint, not decrement by one"
+    );
+
+    // A stale, reordered failure with a higher hint must NOT push next_index back up.
+    n1.step(Message::AppendEntriesResponse {
+        from: 2,
+        msg: AppendEntriesResponse {
+            term: 1,
+            success: false,
+            match_index: 9,
+        },
+    });
+    let ni = match &n1.role {
+        Role::Leader { next_index, .. } => next_index[&2],
+        _ => panic!("n1 must still be leader"),
+    };
+    assert_eq!(
+        ni, 4,
+        "a stale higher hint must not raise next_index (monotonic backoff)"
+    );
+}
+
+// ── InstallSnapshot records the real leader (regression: follower-of-self) ─
+//
+// `handle_install_snapshot(from, _)` adopts `from` as the leader. The raft-kv
+// wire layer used to pass the *destination* peer's id as the snapshot's
+// leader_id, so a follower that installed a snapshot recorded itself as leader.
+// This guards the core invariant: `from` is the leader, and leader_id follows it.
+
+#[test]
+fn install_snapshot_sets_leader_to_sender() {
+    let self_id: NodeId = 3;
+    let leader: NodeId = 2;
+    let mut n = node(self_id, vec![1, leader]);
+    // A short log so the snapshot's compaction path has something to compact.
+    for i in 1..=5 {
+        n.log.append(entry(i, 1));
+    }
+
+    n.step(Message::InstallSnapshot {
+        from: leader,
+        msg: InstallSnapshot {
+            term: 7,
+            leader_id: leader,
+            snapshot: Snapshot {
+                last_index: 3,
+                last_term: 1,
+                data: b"{}".to_vec(),
+            },
+        },
+    });
+
+    assert_eq!(
+        n.leader_id(),
+        Some(leader),
+        "after installing a snapshot the follower must point at the sending leader, never itself"
+    );
+    assert_ne!(
+        n.leader_id(),
+        Some(self_id),
+        "must not record itself as leader"
+    );
+    assert!(!n.is_leader());
 }

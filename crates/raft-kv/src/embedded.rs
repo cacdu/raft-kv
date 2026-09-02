@@ -188,11 +188,13 @@ impl RaftKv {
     }
 
     pub async fn status(&self) -> Status {
-        let leader_id = self.handle.leader_id().await;
+        // Read is_leader and leader_id under one lock so they always describe
+        // the same instant (see NodeHandle::role_status).
+        let (is_leader, leader_id) = self.handle.role_status().await;
         let leader_addr = self.app_addr_of(leader_id).await;
         Status {
             id: self.id,
-            is_leader: self.handle.is_leader().await,
+            is_leader,
             leader_id,
             leader_addr,
         }

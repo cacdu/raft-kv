@@ -200,6 +200,16 @@ impl NodeHandle {
         self.node.lock().await.is_leader()
     }
 
+    /// `(is_leader, leader_id)` read under a single lock, so the two can never
+    /// disagree. Reading them through separate `is_leader()`/`leader_id()`
+    /// calls is a TOCTOU: the role can change between the two locks, which
+    /// could surface impossible states like a follower that reports itself as
+    /// the leader.
+    pub async fn role_status(&self) -> (bool, Option<NodeId>) {
+        let node = self.node.lock().await;
+        (node.is_leader(), node.leader_id())
+    }
+
     /// If this node is the current leader, return its commit_index as the read_index.
     /// Returns None for followers — callers should redirect to the leader.
     pub async fn read_index_if_leader(&self) -> Option<LogIndex> {
@@ -456,7 +466,10 @@ impl NodeHandle {
         if !ready.snapshot_to_send.is_empty() {
             let snap_opt = self.last_snapshot.lock().await.clone();
             if let Some(snap) = snap_opt {
-                let leader_term = self.node.lock().await.current_term;
+                let (leader_id, leader_term) = {
+                    let node = self.node.lock().await;
+                    (node.id, node.current_term)
+                };
                 let clients: Vec<PeerClient> = {
                     let peers = self.peers.lock().await;
                     ready
@@ -474,7 +487,10 @@ impl NodeHandle {
                     let this = Arc::clone(&self);
                     let snap = snap.clone();
                     tokio::spawn(async move {
-                        if let Some(resp) = client.send_install_snapshot(leader_term, snap).await {
+                        if let Some(resp) = client
+                            .send_install_snapshot(leader_id, leader_term, snap)
+                            .await
+                        {
                             this.step_and_persist(resp).await;
                         }
                     });
