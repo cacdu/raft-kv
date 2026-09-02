@@ -23,8 +23,10 @@ fn tick_n(node: &mut RaftNode, n: u32) -> Vec<Ready> {
 #[test]
 fn tick_triggers_election_and_emits_hard_state() {
     let mut n = node(1, vec![2, 3]);
-    // election_timeout is randomized in [10, 19], so 20 ticks always fires.
-    let readies = tick_n(&mut n, 20);
+    // Timeout is randomized in [10, 19]. 19 ticks fires exactly one election:
+    // it always fires by tick 19, and a second would need >= 20 ticks (10 to the
+    // first fire + 10 more), so the count here can't be flaky.
+    let readies = tick_n(&mut n, 19);
 
     // Exactly one Ready should carry a HardState (the one where election fired).
     let with_hs: Vec<_> = readies.iter().filter(|r| r.hard_state.is_some()).collect();
@@ -284,8 +286,9 @@ fn run_election() -> (RaftNode, RaftNode) {
     let mut n1 = node(1, vec![2, 3]);
     let mut n2 = node(2, vec![1, 3]);
 
-    // 20 ticks guarantees election fires (timeout randomized in [10, 19]).
-    let readies = tick_n(&mut n1, 20);
+    // 19 ticks fires exactly one election (timeout in [10, 19]): it always fires
+    // by tick 19, and a second needs >= 20 ticks — so n1 can't slip to term 2.
+    let readies = tick_n(&mut n1, 19);
 
     // Find the ready that carries RequestVote messages.
     let election_ready = readies
@@ -295,7 +298,7 @@ fn run_election() -> (RaftNode, RaftNode) {
                 .iter()
                 .any(|(_, m)| matches!(m, Message::RequestVote { .. }))
         })
-        .expect("election must fire within 20 ticks");
+        .expect("election must fire within 19 ticks");
 
     // Deliver RequestVote to n2 and get grant.
     let (_, rv_for_n2) = election_ready
