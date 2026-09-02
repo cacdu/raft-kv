@@ -176,6 +176,18 @@ impl RaftNode {
             .unwrap_or(false);
 
         if !prev_term_ok {
+            // Fast-rollback hint (Raft §5.3): the first index of the
+            // conflicting term. The leader jumps next_index straight here
+            // instead of walking back one entry per round trip.
+            //
+            // Returning `last_index()` (the previous behaviour) was a deadlock:
+            // the leader used the hint as a *floor* for next_index, so when the
+            // follower's log ended *above* the true match point — e.g. a
+            // divergent, uncommitted tail left by a stale term — next_index
+            // could never back down past that tail and the follower never
+            // reconciled. The conflict hint below is floored at our committed
+            // prefix, which is guaranteed identical to the leader's, so it is
+            // always a safe resume point and guarantees termination.
             self.pending_ready.messages.push((
                 from,
                 Message::AppendEntriesResponse {
@@ -183,7 +195,7 @@ impl RaftNode {
                     msg: AppendEntriesResponse {
                         term: self.current_term,
                         success: false,
-                        match_index: self.log.last_index(),
+                        match_index: self.conflict_hint(msg.prev_log_index),
                     },
                 },
             ));
@@ -248,10 +260,34 @@ impl RaftNode {
             *next_index.entry(from).or_insert(1) = msg.match_index + 1;
             self.advance_commit_index();
         } else {
-            // Back off next_index for this peer
+            // Jump next_index straight to the follower's conflict hint (the
+            // first index of its conflicting term). `min` keeps this monotonic
+            // under the async fan-out: a stale, reordered failure carrying an
+            // older (higher) hint must never push next_index back *up*.
             let ni = next_index.entry(from).or_insert(1);
-            *ni = (*ni).saturating_sub(1).max(msg.match_index + 1).max(1);
+            *ni = (*ni).min(msg.match_index.max(1));
         }
+    }
+
+    /// First index of the term that conflicts at `prev_log_index`, floored at
+    /// the committed (and snapshotted) prefix. Used as the fast-rollback hint
+    /// a follower returns on a failed AppendEntries. Flooring at the committed
+    /// prefix is what makes it safe: those entries are guaranteed to match the
+    /// leader, so next_index can always resume there, and it can never rewind
+    /// below a committed entry (which would risk erasing committed state).
+    fn conflict_hint(&self, prev_log_index: LogIndex) -> LogIndex {
+        let floor = self.commit_index.max(self.log.snapshot_index()) + 1;
+        // Log too short to even have prev_log_index: resume just past our tail.
+        if prev_log_index > self.log.last_index() {
+            return (self.log.last_index() + 1).max(floor);
+        }
+        // Term conflict at prev_log_index: walk back to the start of that term.
+        let conflict_term = self.log.term_at(prev_log_index);
+        let mut idx = prev_log_index;
+        while idx > floor && self.log.term_at(idx - 1) == conflict_term {
+            idx -= 1;
+        }
+        idx.max(floor)
     }
 
     // ── Commit ────────────────────────────────────────────────────────────

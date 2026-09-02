@@ -60,12 +60,17 @@ impl PeerClient {
 
     pub async fn send_install_snapshot(
         &self,
+        leader_id: NodeId,
         leader_term: u64,
         snapshot: Snapshot,
     ) -> Option<Message> {
+        // `self.id` is the *destination* peer, not the leader. Sending it as
+        // `leader_id` made the receiver record itself as the leader once it had
+        // installed the snapshot (it appeared as a "follower of itself"). The
+        // leader's own id is passed in explicitly.
         let req = proto::InstallSnapshotRequest {
             term: leader_term,
-            leader_id: self.id,
+            leader_id,
             last_index: snapshot.last_index,
             last_term: snapshot.last_term,
             data: snapshot.data,
