@@ -46,3 +46,23 @@ jobs:
 
       - name: Fmt check
         run: cargo fmt --all -- --check
+
+  # Aggregator: the ONLY job referenced by branch protection on main.
+  # Its name must stay "CI Gate" forever; jobs above can be renamed, split
+  # or turned into matrices freely — just keep them listed in `needs`.
+  gate:
+    name: CI Gate
+    if: always()
+    needs: [test]
+    runs-on: ubuntu-latest
+    steps:
+      - name: Verify every required job succeeded
+        run: |
+          results="${{ join(needs.*.result, ' ') }}"
+          echo "upstream job results: $results"
+          for r in $results; do
+            if [ "$r" != "success" ]; then
+              echo "::error::a required job did not succeed (got '$r')"
+              exit 1
+            fi
+          done
