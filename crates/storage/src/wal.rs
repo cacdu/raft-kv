@@ -1,13 +1,21 @@
 /// Write-Ahead Log for Raft log entries and hard state.
 ///
-/// Record format (binary, little-endian):
-///   [4 bytes] payload length (u32)
-///   [4 bytes] CRC32 checksum of payload
-///   [N bytes] JSON-encoded WalRecord
+/// File layout:
+///   [8 bytes] `RKVWAL\x02\n` — format marker, v2 files only
+///   then a sequence of records:
+///     [4 bytes] payload length (u32, little-endian)
+///     [4 bytes] CRC32 checksum of payload
+///     [N bytes] encoded WalRecord
 ///
-/// On recovery, records with invalid checksums are discarded (truncated log).
+/// A file with no marker is a 0.1.x WAL whose payloads are JSON; v2 payloads
+/// are postcard. The codec is decided once at open time and every append uses
+/// it, so a single file never mixes the two. Legacy files migrate on the first
+/// rotation.
+///
+/// On recovery, a record that is short, implausibly sized or checksum-invalid
+/// ends the replay: that is a torn tail, and it is truncated away.
 use std::{
-    io::{self, BufReader, Read, Write},
+    io::{self, BufReader, Read, Seek, SeekFrom, Write},
     path::Path,
 };
 
@@ -23,6 +31,12 @@ use tracing::warn;
 /// this code ever wrote — it is garbage in a torn tail.
 const MAX_RECORD_LEN: usize = 64 * 1024 * 1024;
 
+/// Marks a file whose records are postcard-encoded. Absent in 0.1.x WALs.
+const WAL_MAGIC_V2: [u8; 8] = *b"RKVWAL\x02\n";
+
+/// Length prefix + checksum that precede every payload.
+const RECORD_HEADER_LEN: u64 = 8;
+
 #[derive(Debug, Error)]
 pub enum WalError {
     #[error("i/o: {0}")]
@@ -31,6 +45,23 @@ pub enum WalError {
     Corrupt { offset: u64, reason: &'static str },
     #[error("json: {0}")]
     Json(#[from] serde_json::Error),
+    #[error("postcard: {0}")]
+    Postcard(#[from] postcard::Error),
+}
+
+/// How the payloads in one file are encoded.
+///
+/// The WAL never leaves the node — unlike `Snapshot::data`, which travels over
+/// InstallSnapshot and therefore stays JSON — so its encoding is free to change
+/// as long as existing files keep replaying.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Codec {
+    /// 0.1.x: `serde_json`. Every byte of a payload costs a decimal number and
+    /// a comma inside another JSON document — a ~3.5x amplification on a store
+    /// whose entries *are* bytes.
+    LegacyJson,
+    /// 0.1.4+: `postcard`. Varints shrink the log indices too.
+    PostcardV2,
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -53,6 +84,7 @@ pub enum WalRecord {
 
 pub struct Wal {
     file: std::fs::File,
+    codec: Codec,
 }
 
 impl Wal {
@@ -65,13 +97,14 @@ impl Wal {
             .open(path)?;
 
         let file_len = file.metadata()?.len();
-        let (records, valid_len) = Self::read_all(&mut file, file_len)?;
+        let (mut codec, data_start) = Self::detect_codec(&mut file, file_len)?;
+        let (records, valid_len) = Self::read_all(&mut file, data_start, file_len, codec)?;
 
         // A record that was never fsynced was never acknowledged to anyone, so
         // dropping the tail is safe — and it is the only way the node starts at
         // all after a crash mid-append or a volume that filled up. Truncate
         // before the first append, or the next record would be written behind
-        // the garbage and the file would never recover.
+        // the garbage and the file would never replay past it.
         if valid_len < file_len {
             warn!(
                 path = %path.display(),
@@ -83,7 +116,34 @@ impl Wal {
             file.sync_all()?;
         }
 
-        Ok((Self { file }, records))
+        // Nothing legible survived in a legacy file: there is no history left
+        // to stay compatible with, so start it over as v2 rather than writing
+        // JSON forever.
+        if codec == Codec::LegacyJson && valid_len == 0 {
+            file.write_all(&WAL_MAGIC_V2)?;
+            file.sync_data()?;
+            codec = Codec::PostcardV2;
+        }
+
+        Ok((Self { file, codec }, records))
+    }
+
+    /// Decide the on-disk codec once, and return the offset where records
+    /// start. An empty file gets the v2 marker written now.
+    fn detect_codec(file: &mut std::fs::File, file_len: u64) -> Result<(Codec, u64), WalError> {
+        if file_len == 0 {
+            file.write_all(&WAL_MAGIC_V2)?;
+            file.sync_data()?;
+            return Ok((Codec::PostcardV2, WAL_MAGIC_V2.len() as u64));
+        }
+        if file_len >= WAL_MAGIC_V2.len() as u64 {
+            let mut magic = [0u8; WAL_MAGIC_V2.len()];
+            file.read_exact(&mut magic)?;
+            if magic == WAL_MAGIC_V2 {
+                return Ok((Codec::PostcardV2, WAL_MAGIC_V2.len() as u64));
+            }
+        }
+        Ok((Codec::LegacyJson, 0))
     }
 
     /// Append a single record and fsync it to disk before returning.
@@ -103,7 +163,7 @@ impl Wal {
     }
 
     fn write_record(&mut self, record: &WalRecord) -> Result<(), WalError> {
-        let payload = serde_json::to_vec(record)?;
+        let payload = encode(self.codec, record)?;
         let checksum = {
             let mut h = Hasher::new();
             h.update(&payload);
@@ -136,11 +196,14 @@ impl Wal {
     /// `Corrupt`, because silently dropping the rest of the log would hide it.
     fn read_all(
         file: &mut std::fs::File,
+        start: u64,
         file_len: u64,
+        codec: Codec,
     ) -> Result<(Vec<WalRecord>, u64), WalError> {
+        file.seek(SeekFrom::Start(start))?;
         let mut reader = BufReader::new(&*file);
         let mut records = Vec::new();
-        let mut offset: u64 = 0;
+        let mut offset = start;
 
         loop {
             let mut len_buf = [0u8; 4];
@@ -182,7 +245,7 @@ impl Wal {
                 break;
             }
 
-            records.push(serde_json::from_slice(&payload)?);
+            records.push(decode(codec, &payload)?);
             offset += RECORD_HEADER_LEN + len as u64;
         }
 
@@ -190,8 +253,19 @@ impl Wal {
     }
 }
 
-/// Length prefix + checksum that precede every payload.
-const RECORD_HEADER_LEN: u64 = 8;
+fn encode(codec: Codec, record: &WalRecord) -> Result<Vec<u8>, WalError> {
+    match codec {
+        Codec::LegacyJson => Ok(serde_json::to_vec(record)?),
+        Codec::PostcardV2 => Ok(postcard::to_stdvec(record)?),
+    }
+}
+
+fn decode(codec: Codec, payload: &[u8]) -> Result<WalRecord, WalError> {
+    match codec {
+        Codec::LegacyJson => Ok(serde_json::from_slice(payload)?),
+        Codec::PostcardV2 => Ok(postcard::from_bytes(payload)?),
+    }
+}
 
 /// `read_exact`, but a short read reports `false` instead of erroring: at the
 /// end of a WAL that is exactly how a crash mid-append looks.
@@ -389,11 +463,12 @@ mod tests {
         // Not an interrupted append: a complete frame with records after it.
         // Dropping the rest of the log here would hide bit rot (or a bug).
         let (tmp, _two, _total) = wal_with_three_records();
-        flip_byte(tmp.path(), RECORD_HEADER_LEN as usize);
+        let first_record = WAL_MAGIC_V2.len() as u64;
+        flip_byte(tmp.path(), (first_record + RECORD_HEADER_LEN) as usize);
 
         match Wal::open(tmp.path()) {
             Err(WalError::Corrupt { offset, reason }) => {
-                assert_eq!(offset, 0);
+                assert_eq!(offset, first_record);
                 assert_eq!(reason, "checksum mismatch");
             }
             Err(e) => panic!("expected Corrupt, got {e}"),
@@ -417,6 +492,121 @@ mod tests {
             tmp.path().metadata().unwrap().len(),
             two,
             "the bogus header is truncated away"
+        );
+    }
+
+    // ── The WAL codec: ~3.5x amplification from double JSON encoding ─────────
+    //
+    // Every record was `serde_json::to_vec`'d, so a payload that is *already*
+    // bytes — LogEntry::command, Snapshot::data — was re-encoded one decimal
+    // number and comma per byte, inside another JSON document. A ~60-byte pixel
+    // command cost ~230 bytes on disk; the ~780 KB serialized board cost ~1.2 MB
+    // per snapshot, times ~988 snapshots, on a 1 GB volume.
+    //
+    // `serde_bytes` alone does not fix this: serde_json's `serialize_bytes`
+    // defaults to writing a JSON array of integers, byte for byte identical to
+    // the seq encoding. The fix has to be the codec. Since the WAL never leaves
+    // the node, changing it is safe — unlike `Snapshot::data`, which travels
+    // over InstallSnapshot and stays JSON so mixed-version clusters keep working.
+
+    /// A gambas pixel write, as the embedder actually produces it.
+    fn pixel_entry(index: u64) -> WalRecord {
+        let command = serde_json::to_vec(&crate::kv::Command::Set {
+            key: "px:012:034".to_string(),
+            value: "7".to_string(),
+        })
+        .unwrap();
+        WalRecord::Entry(LogEntry {
+            index,
+            term: 4,
+            entry_type: EntryType::Normal,
+            command,
+        })
+    }
+
+    /// Frame records the way 0.1.x did — no marker, JSON payloads — so the
+    /// legacy read path is exercised against real bytes rather than a mock.
+    fn write_legacy_wal(path: &Path, records: &[WalRecord]) {
+        let mut bytes = Vec::new();
+        for record in records {
+            let payload = serde_json::to_vec(record).unwrap();
+            let mut h = Hasher::new();
+            h.update(&payload);
+            bytes.extend_from_slice(&(payload.len() as u32).to_le_bytes());
+            bytes.extend_from_slice(&h.finalize().to_le_bytes());
+            bytes.extend_from_slice(&payload);
+        }
+        std::fs::write(path, bytes).unwrap();
+    }
+
+    #[test]
+    fn a_fresh_wal_is_marked_v2_and_round_trips() {
+        let tmp = tempfile::NamedTempFile::new().unwrap();
+        {
+            let (mut wal, _) = Wal::open(tmp.path()).unwrap();
+            wal.append(&pixel_entry(1)).unwrap();
+        }
+        let bytes = std::fs::read(tmp.path()).unwrap();
+        assert_eq!(&bytes[..8], &WAL_MAGIC_V2, "a new file carries the marker");
+
+        let (_wal, records) = Wal::open(tmp.path()).unwrap();
+        assert_eq!(records.len(), 1);
+        match &records[0] {
+            WalRecord::Entry(e) => assert_eq!(e.index, 1),
+            other => panic!("expected an Entry, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn a_legacy_json_wal_still_replays_and_stays_json() {
+        // node1 is the golden copy and its WAL is 0.1.x JSON: it has to keep
+        // opening, and it has to keep being appended in the codec it already
+        // uses — a file must never hold both.
+        let tmp = tempfile::NamedTempFile::new().unwrap();
+        write_legacy_wal(
+            tmp.path(),
+            &[
+                WalRecord::HardState {
+                    term: 3,
+                    voted_for: Some(1),
+                },
+                pixel_entry(1),
+            ],
+        );
+
+        let (mut wal, records) = Wal::open(tmp.path()).unwrap();
+        assert_eq!(records.len(), 2, "a 0.1.x WAL must still replay");
+        wal.append(&pixel_entry(2)).unwrap();
+        drop(wal);
+
+        let bytes = std::fs::read(tmp.path()).unwrap();
+        assert_ne!(
+            &bytes[..8],
+            &WAL_MAGIC_V2,
+            "a legacy file is not relabelled"
+        );
+        let (_wal, records) = Wal::open(tmp.path()).unwrap();
+        assert_eq!(records.len(), 3, "the appended record is readable too");
+    }
+
+    #[test]
+    fn a_v2_record_is_a_fraction_of_its_json_size() {
+        let v2 = tempfile::NamedTempFile::new().unwrap();
+        {
+            let (mut wal, _) = Wal::open(v2.path()).unwrap();
+            wal.append(&pixel_entry(49_400)).unwrap();
+        }
+        // Minus the one-off file marker: compare record against record.
+        let v2_len = v2.path().metadata().unwrap().len() - WAL_MAGIC_V2.len() as u64;
+
+        let legacy = tempfile::NamedTempFile::new().unwrap();
+        write_legacy_wal(legacy.path(), &[pixel_entry(49_400)]);
+        let json_len = legacy.path().metadata().unwrap().len();
+
+        assert!(
+            v2_len * 2 < json_len,
+            "a pixel record must cost less than half of its JSON form \
+             (v2 {v2_len} B vs json {json_len} B)"
         );
     }
 }

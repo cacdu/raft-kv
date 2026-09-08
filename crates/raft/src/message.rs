@@ -42,6 +42,10 @@ pub struct LogEntry {
     #[serde(default)]
     pub entry_type: EntryType,
     /// Serialized KV command (set/delete). Empty = no-op. ConfChange = ConfChangeCmd.
+    /// `serde_bytes` hands the payload to the serializer as one blob instead of
+    /// element by element — free with JSON (which writes the same array of
+    /// integers either way), a real saving with the WAL's binary codec.
+    #[serde(with = "serde_bytes")]
     pub command: Vec<u8>,
 }
 
@@ -87,7 +91,10 @@ pub struct AppendEntriesResponse {
 pub struct Snapshot {
     pub last_index: LogIndex,
     pub last_term: Term,
-    /// Serialized KV store (serde_json of the BTreeMap).
+    /// Serialized KV store (serde_json of the BTreeMap). Stays JSON on purpose:
+    /// unlike the WAL, this crosses the wire in InstallSnapshot, so changing it
+    /// would break a cluster mid-upgrade.
+    #[serde(with = "serde_bytes")]
     pub data: Vec<u8>,
 }
 
