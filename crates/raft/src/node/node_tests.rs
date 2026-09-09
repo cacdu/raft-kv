@@ -1,8 +1,8 @@
 use super::{RaftNode, Ready, Restore, Role};
 use crate::config::Config;
 use crate::message::{
-    AppendEntries, AppendEntriesResponse, EntryType, InstallSnapshot, LogEntry, Message, NodeId,
-    RequestVote, Snapshot,
+    AppendEntries, AppendEntriesResponse, EntryType, InstallSnapshot, InstallSnapshotResponse,
+    LogEntry, Message, NodeId, RequestVote, Snapshot,
 };
 
 fn node(id: u64, peers: Vec<u64>) -> RaftNode {
@@ -882,4 +882,132 @@ fn advancing_the_commit_index_emits_hard_state() {
         .expect("a commit advance must reach durable storage");
     assert_eq!(hard_state.commit, leader.commit_index);
     assert!(hard_state.commit > 0);
+}
+
+// ── A lagging peer must be credited with the snapshot it actually got ─────
+//
+// `handle_install_snapshot_response` advanced the peer to the *leader's*
+// current `log.snapshot_index()`. If the leader compacted again between
+// sending the RPC and reading the reply, the peer was credited with entries it
+// had never seen, and those entries could then be counted towards a quorum.
+
+#[test]
+fn an_install_snapshot_response_advances_the_peer_to_what_it_installed() {
+    let (mut leader, _follower) = run_election();
+    let term = leader.current_term;
+    for index in leader.log.last_index() + 1..=20 {
+        leader.log.append(entry(index, term));
+    }
+    leader.commit_index = 20;
+    leader.last_applied = 20;
+    // The leader has moved on since the snapshot went out.
+    leader.log.compact(15, term);
+    if let Role::Leader {
+        next_index,
+        match_index,
+    } = &mut leader.role
+    {
+        next_index.insert(2, 1);
+        match_index.insert(2, 0);
+    }
+
+    leader.step(Message::InstallSnapshotResponse {
+        from: 2,
+        msg: InstallSnapshotResponse {
+            term,
+            success: true,
+            last_index: 8,
+        },
+    });
+
+    let Role::Leader {
+        next_index,
+        match_index,
+    } = &leader.role
+    else {
+        panic!("the leader must still be the leader");
+    };
+    assert_eq!(
+        match_index[&2], 8,
+        "the peer installed snapshot 8, not the leader's current 15"
+    );
+    assert_eq!(next_index[&2], 9);
+}
+
+#[test]
+fn a_peer_that_reports_no_index_keeps_the_old_behaviour() {
+    // Pre-0.1.4 followers do not fill the field in; 0 must not be read as
+    // "the peer installed nothing".
+    let (mut leader, _follower) = run_election();
+    let term = leader.current_term;
+    for index in leader.log.last_index() + 1..=20 {
+        leader.log.append(entry(index, term));
+    }
+    leader.commit_index = 20;
+    leader.last_applied = 20;
+    leader.log.compact(15, term);
+    if let Role::Leader {
+        next_index,
+        match_index,
+    } = &mut leader.role
+    {
+        next_index.insert(2, 1);
+        match_index.insert(2, 0);
+    }
+
+    leader.step(Message::InstallSnapshotResponse {
+        from: 2,
+        msg: InstallSnapshotResponse {
+            term,
+            success: true,
+            last_index: 0,
+        },
+    });
+
+    let Role::Leader { match_index, .. } = &leader.role else {
+        panic!("the leader must still be the leader");
+    };
+    assert_eq!(match_index[&2], 15);
+}
+
+#[test]
+fn a_node_with_an_empty_log_can_install_a_snapshot_from_far_ahead() {
+    // The whole point of InstallSnapshot: the follower is so far behind that
+    // the leader has no entries left to send it. Compacting to an index beyond
+    // the end of the log used to panic.
+    let mut n = node(3, vec![1, 2]);
+    let ready = n.step(Message::InstallSnapshot {
+        from: 1,
+        msg: InstallSnapshot {
+            term: 7,
+            leader_id: 1,
+            snapshot: Snapshot {
+                last_index: 49_400,
+                last_term: 7,
+                data: b"{}".to_vec(),
+            },
+        },
+    });
+
+    assert_eq!(n.log.snapshot_index(), 49_400);
+    assert_eq!(
+        n.log.last_index(),
+        49_400,
+        "nothing survives below the base"
+    );
+    assert_eq!(n.commit_index, 49_400);
+    assert!(
+        ready.snapshot_to_apply.is_some(),
+        "the state machine must be handed the snapshot to apply"
+    );
+    let hint = ready
+        .messages
+        .iter()
+        .find_map(|(_, m)| match m {
+            Message::InstallSnapshotResponse { msg, .. } => Some(msg),
+            _ => None,
+        })
+        .expect("the follower must answer");
+    assert!(hint.success);
+    assert_eq!(hint.last_index, 49_400);
 }

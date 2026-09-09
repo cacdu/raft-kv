@@ -77,6 +77,7 @@ impl RaftNode {
                     msg: InstallSnapshotResponse {
                         term: self.current_term,
                         success: false,
+                        last_index: self.log.snapshot_index(),
                     },
                 },
             ));
@@ -88,8 +89,11 @@ impl RaftNode {
 
         let snap = &msg.snapshot;
 
-        // Only apply if the snapshot is newer than what we have.
+        // Only apply if the snapshot is newer than what we have. Reporting our
+        // own commit index keeps the leader's match_index truthful: we are
+        // already at least that far.
         if snap.last_index <= self.commit_index {
+            let last_index = self.commit_index;
             self.pending_ready.messages.push((
                 from,
                 Message::InstallSnapshotResponse {
@@ -97,6 +101,7 @@ impl RaftNode {
                     msg: InstallSnapshotResponse {
                         term: self.current_term,
                         success: true,
+                        last_index,
                     },
                 },
             ));
@@ -112,6 +117,7 @@ impl RaftNode {
         // Signal NodeHandle to replace the KV store with the snapshot data.
         self.pending_ready.snapshot_to_apply = Some(msg.snapshot.clone());
 
+        let last_index = msg.snapshot.last_index;
         self.pending_ready.messages.push((
             from,
             Message::InstallSnapshotResponse {
@@ -119,6 +125,7 @@ impl RaftNode {
                 msg: InstallSnapshotResponse {
                     term: self.current_term,
                     success: true,
+                    last_index,
                 },
             },
         ));
@@ -143,10 +150,21 @@ impl RaftNode {
         else {
             return;
         };
-        // The peer now has the full snapshot; advance its indices.
-        let snap_index = self.log.snapshot_index();
-        *match_index.entry(from).or_insert(0) = snap_index;
-        *next_index.entry(from).or_insert(1) = snap_index + 1;
+        // Advance the peer to the snapshot it says it installed. Using our own
+        // `log.snapshot_index()` was wrong whenever it had moved on since the
+        // RPC went out: the peer would be credited with entries it has never
+        // seen. A peer that does not report an index (pre-0.1.4) falls back to
+        // the old behaviour, and `max` keeps match_index monotonic under the
+        // async fan-out.
+        let installed = if msg.last_index == 0 {
+            self.log.snapshot_index()
+        } else {
+            msg.last_index
+        };
+        let peer_match = match_index.entry(from).or_insert(0);
+        *peer_match = (*peer_match).max(installed);
+        let peer_next = next_index.entry(from).or_insert(1);
+        *peer_next = (*peer_next).max(installed + 1);
         self.advance_commit_index();
     }
 

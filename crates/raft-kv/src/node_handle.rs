@@ -350,7 +350,10 @@ impl NodeHandle {
 
         let (last_term, hard_state) = {
             let node = self.node.lock().await;
-            if target <= node.log.snapshot_index() || target > node.last_applied {
+            // `<` rather than `<=`: taking a snapshot *at* the current base is
+            // a no-op for the log but is how a leader with no usable snapshot
+            // in memory produces one for a lagging peer.
+            if target < node.log.snapshot_index() || target > node.last_applied {
                 return;
             }
             (
@@ -484,13 +487,22 @@ impl NodeHandle {
             let mut node = self.node.lock().await;
             node.step(msg)
         };
+        // Every RPC the gRPC server exposes has to find its reply here.
+        // InstallSnapshotResponse was missing from this filter, so *every*
+        // InstallSnapshot RPC answered `Status::internal` even though the
+        // follower had installed the snapshot: the leader saw a failed RPC,
+        // never advanced the peer, and re-sent the whole snapshot on the next
+        // tick, forever. That is the other half of "a node with an empty WAL
+        // never catches up".
         let response = ready
             .messages
             .iter()
             .find(|(_, m)| {
                 matches!(
                     m,
-                    Message::RequestVoteResponse { .. } | Message::AppendEntriesResponse { .. }
+                    Message::RequestVoteResponse { .. }
+                        | Message::AppendEntriesResponse { .. }
+                        | Message::InstallSnapshotResponse { .. }
                 )
             })
             .map(|(_, m)| m.clone());
@@ -615,38 +627,7 @@ impl NodeHandle {
     async fn fan_out(self: Arc<Self>, ready: Ready) {
         // Leader: send snapshots to lagging peers that can't be caught up via AppendEntries.
         if !ready.snapshot_to_send.is_empty() {
-            let snap_opt = self.last_snapshot.lock().await.clone();
-            if let Some(snap) = snap_opt {
-                let (leader_id, leader_term) = {
-                    let node = self.node.lock().await;
-                    (node.id, node.current_term)
-                };
-                let clients: Vec<PeerClient> = {
-                    let peers = self.peers.lock().await;
-                    ready
-                        .snapshot_to_send
-                        .iter()
-                        .filter_map(|id| peers.get(id).cloned())
-                        .collect()
-                };
-                for client in clients {
-                    debug!(
-                        peer = client.id,
-                        index = snap.last_index,
-                        "sending snapshot"
-                    );
-                    let this = Arc::clone(&self);
-                    let snap = snap.clone();
-                    tokio::spawn(async move {
-                        if let Some(resp) = client
-                            .send_install_snapshot(leader_id, leader_term, snap)
-                            .await
-                        {
-                            this.step_and_persist(resp).await;
-                        }
-                    });
-                }
-            }
+            self.send_snapshots(&ready.snapshot_to_send).await;
         }
 
         for (client, msg) in self.clients_for(ready.messages).await {
@@ -673,6 +654,73 @@ impl NodeHandle {
                 }
             });
         }
+    }
+
+    /// Send the current snapshot to every peer whose next_index has fallen
+    /// inside the compacted log.
+    ///
+    /// 0.1.3 read `last_snapshot` and, if it was `None`, skipped the whole
+    /// block — no log line, no fallback. The peer was simply not contacted for
+    /// that tick, and the next tick reached the same dead end: a node brought
+    /// up with an empty WAL never caught up. If there is no usable snapshot we
+    /// take one now, and if we still cannot, we say so.
+    async fn send_snapshots(self: &Arc<Self>, peers: &[NodeId]) {
+        let snap = match self.snapshot_for_peers().await {
+            Some(snap) => snap,
+            None => {
+                warn!(
+                    ?peers,
+                    "peers need a snapshot but none could be produced; they cannot catch up"
+                );
+                return;
+            }
+        };
+        let (leader_id, leader_term) = {
+            let node = self.node.lock().await;
+            (node.id, node.current_term)
+        };
+        let clients: Vec<PeerClient> = {
+            let peers_map = self.peers.lock().await;
+            peers
+                .iter()
+                .filter_map(|id| peers_map.get(id).cloned())
+                .collect()
+        };
+        for client in clients {
+            debug!(
+                peer = client.id,
+                index = snap.last_index,
+                "sending snapshot"
+            );
+            let this = Arc::clone(self);
+            let snap = snap.clone();
+            tokio::spawn(async move {
+                if let Some(resp) = client
+                    .send_install_snapshot(leader_id, leader_term, snap)
+                    .await
+                {
+                    this.step_and_persist(resp).await;
+                }
+            });
+        }
+    }
+
+    /// A snapshot that covers this node's compacted prefix, taking one now if
+    /// the one in memory is missing or older than the log's base.
+    async fn snapshot_for_peers(self: &Arc<Self>) -> Option<Snapshot> {
+        let (base, applied) = {
+            let node = self.node.lock().await;
+            (node.log.snapshot_index(), node.last_applied)
+        };
+        if let Some(snap) = self.last_snapshot.lock().await.clone() {
+            if snap.last_index >= base {
+                return Some(snap);
+            }
+        }
+        // Snapshot the point the state machine has actually reached, which is
+        // always at or above the compacted prefix — exactly what the peer needs.
+        self.try_compact(applied.max(base)).await;
+        self.last_snapshot.lock().await.clone()
     }
 
     /// Step one peer response through the SM, persist and apply its effects,
@@ -1406,6 +1454,116 @@ mod tests {
                 *handle.subscribe_applied().borrow(),
                 55,
                 "a linearizable read must not be satisfied by a stale wait"
+            );
+        });
+    }
+
+    // ── A lagging peer must never be silently abandoned ──────────────────────
+    //
+    // When a peer's next_index falls inside the compacted log the state machine
+    // asks for a snapshot to be sent. `fan_out` read `last_snapshot` and, if it
+    // was None, skipped the whole block — no log line, no fallback — so the peer
+    // was not contacted that tick, and the next tick reached the same dead end.
+
+    #[test]
+    fn a_leader_without_a_snapshot_in_memory_takes_one_for_a_lagging_peer() {
+        let dir = tempfile::tempdir().unwrap();
+        let handle = make_handle_in(dir.path(), 1, vec![2, 3], 5_000);
+        let rt = tokio::runtime::Runtime::new().unwrap();
+
+        rt.block_on(async {
+            {
+                let mut node = handle.node.lock().await;
+                for index in 1..=20u64 {
+                    node.log.append(LogEntry {
+                        index,
+                        term: 1,
+                        entry_type: EntryType::Normal,
+                        command: serde_json::to_vec(&Command::Set {
+                            key: format!("px:{index:03}:001"),
+                            value: "7".to_string(),
+                        })
+                        .unwrap(),
+                    });
+                }
+                node.commit_index = 20;
+                node.last_applied = 20;
+                node.log.compact(10, 1);
+            }
+            {
+                let mut kv = handle.kv.lock().await;
+                kv.apply(
+                    &serde_json::to_vec(&Command::Set {
+                        key: "px:020:001".to_string(),
+                        value: "7".to_string(),
+                    })
+                    .unwrap(),
+                )
+                .unwrap();
+            }
+            let _ = handle.applied_tx.send(20);
+            assert!(
+                handle.last_snapshot.lock().await.is_none(),
+                "precondition: this is exactly where 0.1.3 gave up"
+            );
+
+            let snap = handle
+                .snapshot_for_peers()
+                .await
+                .expect("a snapshot must be produced on demand");
+            assert!(
+                snap.last_index >= 10,
+                "the snapshot must cover the compacted prefix the peer is missing"
+            );
+            assert!(
+                dir.path()
+                    .join(format!("snapshot-{}.bin", snap.last_index))
+                    .exists(),
+                "and it must be durable before it is sent"
+            );
+        });
+    }
+
+    #[test]
+    fn step_rpc_answers_an_install_snapshot() {
+        // `step_rpc` matched only vote and append replies, so every
+        // InstallSnapshot RPC returned Status::internal even though the
+        // follower had installed the snapshot. The leader saw a failed RPC,
+        // never advanced the peer, and re-sent the whole snapshot every tick.
+        use std::collections::BTreeMap;
+
+        let (handle, _dir) = make_handle(1, vec![2, 3]);
+        let board = BTreeMap::from([("px:001:001".to_string(), "7".to_string())]);
+        let rt = tokio::runtime::Runtime::new().unwrap();
+
+        let response = rt.block_on(handle.step_rpc(Message::InstallSnapshot {
+            from: 2,
+            msg: raft::InstallSnapshot {
+                term: 5,
+                leader_id: 2,
+                snapshot: Snapshot {
+                    last_index: 30,
+                    last_term: 5,
+                    data: serde_json::to_vec(&board).unwrap(),
+                },
+            },
+        }));
+
+        match response {
+            Some(Message::InstallSnapshotResponse { msg, .. }) => {
+                assert!(msg.success);
+                assert_eq!(
+                    msg.last_index, 30,
+                    "the follower reports the snapshot it installed"
+                );
+            }
+            other => panic!("InstallSnapshot must produce a reply, got {other:?}"),
+        }
+        rt.block_on(async {
+            assert_eq!(
+                handle.kv.lock().await.get("px:001:001"),
+                Some("7"),
+                "and the snapshot really is applied"
             );
         });
     }

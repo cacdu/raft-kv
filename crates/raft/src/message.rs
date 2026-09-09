@@ -126,6 +126,12 @@ pub struct InstallSnapshot {
 pub struct InstallSnapshotResponse {
     pub term: Term,
     pub success: bool,
+    /// Index of the snapshot the follower installed. The leader advances the
+    /// peer to this, not to its own current snapshot index — which may have
+    /// moved on between sending the RPC and reading the reply. `0` from a
+    /// pre-0.1.4 peer that does not report it.
+    #[serde(default)]
+    pub last_index: LogIndex,
 }
 
 // ── Internal messages ──────────────────────────────────────────────────────

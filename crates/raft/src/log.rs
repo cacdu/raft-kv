@@ -89,9 +89,19 @@ impl RaftLog {
     }
 
     /// Discard entries up to and including `index` (snapshot compaction).
+    ///
+    /// `index` may land *ahead* of everything this log holds — a follower with
+    /// an empty log being caught up by InstallSnapshot. Every entry is then
+    /// discarded, not just a prefix. Draining past the end used to panic, which
+    /// took the RPC down with it and left the peer stuck: the leader saw a
+    /// failed InstallSnapshot and re-sent the same snapshot on the next tick.
     pub fn compact(&mut self, index: LogIndex, term: Term) {
+        if index < self.snapshot_index {
+            return;
+        }
         let offset = (index - self.snapshot_index) as usize;
-        self.entries.drain(0..=offset);
+        let drain_to = offset.min(self.entries.len() - 1);
+        self.entries.drain(0..=drain_to);
         self.snapshot_index = index;
         self.snapshot_term = term;
         // Re-insert sentinel
