@@ -69,6 +69,9 @@ pub enum WalRecord {
     HardState {
         term: Term,
         voted_for: Option<NodeId>,
+        /// See `raft::HardState::commit`. `default` keeps 0.1.x WALs readable.
+        #[serde(default)]
+        commit: LogIndex,
     },
     Entry(LogEntry),
     Snapshot {
@@ -372,6 +375,7 @@ mod tests {
             WalRecord::HardState {
                 term: 7,
                 voted_for: Some(2),
+                commit: 0,
             },
             WalRecord::Entry(LogEntry {
                 index: 1,
@@ -405,7 +409,8 @@ mod tests {
                 recovered[0],
                 WalRecord::HardState {
                     term: 7,
-                    voted_for: Some(2)
+                    voted_for: Some(2),
+                    commit: 0,
                 }
             ),
             "HardState must round-trip"
@@ -442,6 +447,7 @@ mod tests {
         wal.append(&WalRecord::HardState {
             term: 7,
             voted_for: Some(2),
+            commit: 0,
         })
         .unwrap();
         wal.append(&WalRecord::Entry(LogEntry {
@@ -637,6 +643,7 @@ mod tests {
                 WalRecord::HardState {
                     term: 3,
                     voted_for: Some(1),
+                    commit: 0,
                 },
                 pixel_entry(1),
             ],
@@ -698,6 +705,7 @@ mod tests {
             WalRecord::HardState {
                 term: 4,
                 voted_for: Some(1),
+                commit: 12,
             },
             pixel_entry(3),
         ])
@@ -712,8 +720,15 @@ mod tests {
         let (_wal, records) = Wal::open(tmp.path()).unwrap();
         assert_eq!(records.len(), 3, "hard state + entry 3 + the new entry 4");
         assert!(
-            matches!(records[0], WalRecord::HardState { term: 4, .. }),
-            "the rotated file must still carry the term and the vote"
+            matches!(
+                records[0],
+                WalRecord::HardState {
+                    term: 4,
+                    commit: 12,
+                    ..
+                }
+            ),
+            "the rotated file must still carry the term, the vote and the commit"
         );
         match (&records[1], &records[2]) {
             (WalRecord::Entry(a), WalRecord::Entry(b)) => {

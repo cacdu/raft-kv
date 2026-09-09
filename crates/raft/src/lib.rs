@@ -10,4 +10,4 @@ pub use message::{
     InstallSnapshot, InstallSnapshotResponse, LogEntry, LogIndex, Message, NodeId, RequestVote,
     RequestVoteResponse, Snapshot, Term,
 };
-pub use node::{RaftNode, Ready, Role};
+pub use node::{RaftNode, Ready, Restore, Role};

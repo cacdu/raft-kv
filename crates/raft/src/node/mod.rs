@@ -56,6 +56,19 @@ pub struct Ready {
     pub membership_change: Option<crate::message::ConfChangeCmd>,
 }
 
+/// Durable state recovered from disk, handed to [`RaftNode::restore`].
+#[derive(Debug, Default)]
+pub struct Restore {
+    pub term: Term,
+    pub voted_for: Option<NodeId>,
+    /// Last commit index that reached disk. See [`HardState::commit`].
+    pub commit: LogIndex,
+    pub snapshot_index: LogIndex,
+    pub snapshot_term: Term,
+    /// Entries above the snapshot base, conflicts already resolved.
+    pub entries: Vec<LogEntry>,
+}
+
 // ── RaftNode ───────────────────────────────────────────────────────────────
 
 pub struct RaftNode {
@@ -120,23 +133,37 @@ impl RaftNode {
         }
     }
 
-    /// Restore durable state from WAL replay. Call once after new(), before any step().
-    pub fn restore(
-        &mut self,
-        term: Term,
-        voted_for: Option<NodeId>,
-        snapshot_index: LogIndex,
-        snapshot_term: Term,
-        entries: Vec<LogEntry>,
-    ) {
-        self.current_term = term;
-        self.voted_for = voted_for;
-        self.log.restore(snapshot_index, snapshot_term, entries);
-        // commit_index and last_applied start at snapshot_index:
-        // the KV state machine was rebuilt from the snapshot, entries above it are uncommitted
-        // until the new leader re-drives them through AppendEntries.
-        self.commit_index = snapshot_index;
-        self.last_applied = snapshot_index;
+    /// Restore durable state from disk. Call once after new(), before any step().
+    ///
+    /// `commit_index` and `last_applied` are deliberately *not* the same value.
+    /// The state machine really is only at the snapshot — entries above it were
+    /// never applied to the store — but the commit index is durable, so the
+    /// node knows those entries are committed and re-applies them instead of
+    /// waiting for a leader to re-drive them. 0.1.3 conflated the two and reset
+    /// both to the snapshot base, which is what made the anti-truncation floor
+    /// and the read index vacuous after a restart.
+    ///
+    /// Whatever `restore` stages for re-application is left in the pending
+    /// Ready; the caller drains it with [`RaftNode::take_ready`].
+    pub fn restore(&mut self, state: Restore) {
+        self.current_term = state.term;
+        self.voted_for = state.voted_for;
+        self.log
+            .restore(state.snapshot_index, state.snapshot_term, state.entries);
+        // A persisted commit above the recovered log would be a lie: the
+        // entries it names are not there to apply.
+        self.commit_index = state
+            .commit
+            .max(state.snapshot_index)
+            .min(self.log.last_index());
+        self.last_applied = state.snapshot_index;
+        self.apply_committed();
+    }
+
+    /// Drain the pending Ready without stepping. Only [`RaftNode::restore`]
+    /// needs this: everything else gets its Ready from `step`.
+    pub fn take_ready(&mut self) -> Ready {
+        std::mem::take(&mut self.pending_ready)
     }
 
     /// Advance the state machine by one message. Returns accumulated Ready.
@@ -224,10 +251,14 @@ impl RaftNode {
             .random_range(self.config.election_timeout..self.config.election_timeout * 2);
     }
 
-    fn emit_hard_state(&mut self) {
+    /// Stage the durable state for this step. Emitted on a term or vote change
+    /// and whenever the commit index advances — one small extra record, which
+    /// the fsync `persist` already performs amortizes.
+    pub(crate) fn emit_hard_state(&mut self) {
         self.pending_ready.hard_state = Some(HardState {
             term: self.current_term,
             voted_for: self.voted_for,
+            commit: self.commit_index,
         });
     }
 }

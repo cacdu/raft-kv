@@ -408,6 +408,7 @@ mod tests {
             wal.append(&WalRecord::HardState {
                 term: 4,
                 voted_for: Some(1),
+                commit: 51,
             })
             .unwrap();
             for index in 1..=50 {
@@ -448,6 +449,10 @@ mod tests {
         Wal::open_with(&wal_path, |r| replay.push(r)).unwrap();
         assert!(!replay.snapshot_in_wal);
         assert_eq!(replay.term, 4);
+        assert_eq!(
+            replay.commit, 51,
+            "the persisted commit index must survive the rotation too"
+        );
         assert_eq!(
             replay.voted_for,
             Some(1),

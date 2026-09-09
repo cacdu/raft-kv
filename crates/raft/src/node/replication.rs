@@ -107,6 +107,7 @@ impl RaftNode {
         self.log.compact(snap.last_index, snap.last_term);
         self.commit_index = snap.last_index;
         self.last_applied = snap.last_index;
+        self.emit_hard_state();
 
         // Signal NodeHandle to replace the KV store with the snapshot data.
         self.pending_ready.snapshot_to_apply = Some(msg.snapshot.clone());
@@ -221,6 +222,7 @@ impl RaftNode {
         // Advance commit index
         if msg.leader_commit > self.commit_index {
             self.commit_index = msg.leader_commit.min(self.log.last_index());
+            self.emit_hard_state();
             self.apply_committed();
         }
 
@@ -311,12 +313,13 @@ impl RaftNode {
         if let Some(&n) = indices.get(indices.len() - quorum) {
             if n > self.commit_index && self.log.term_at(n) == Some(self.current_term) {
                 self.commit_index = n;
+                self.emit_hard_state();
                 self.apply_committed();
             }
         }
     }
 
-    fn apply_committed(&mut self) {
+    pub(super) fn apply_committed(&mut self) {
         while self.last_applied < self.commit_index {
             self.last_applied += 1;
             if let Some(entry) = self.log.entries_from(self.last_applied).first().cloned() {

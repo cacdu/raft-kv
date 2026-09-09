@@ -1,4 +1,4 @@
-use super::{RaftNode, Ready, Role};
+use super::{RaftNode, Ready, Restore, Role};
 use crate::config::Config;
 use crate::message::{
     AppendEntries, AppendEntriesResponse, EntryType, InstallSnapshot, LogEntry, Message, NodeId,
@@ -196,7 +196,11 @@ fn refusing_vote_does_not_emit_hard_state() {
 #[test]
 fn restore_sets_hard_state() {
     let mut n = node(1, vec![2, 3]);
-    n.restore(7, Some(2), 0, 0, vec![]);
+    n.restore(Restore {
+        term: 7,
+        voted_for: Some(2),
+        ..Default::default()
+    });
     assert_eq!(n.current_term, 7);
     assert_eq!(n.voted_for, Some(2));
 }
@@ -218,7 +222,11 @@ fn restore_loads_log_entries() {
             command: b"set b 2".to_vec(),
         },
     ];
-    n.restore(1, None, 0, 0, entries);
+    n.restore(Restore {
+        term: 1,
+        entries,
+        ..Default::default()
+    });
 
     assert_eq!(n.log.last_index(), 2);
     assert_eq!(n.log.term_at(1), Some(1));
@@ -243,7 +251,13 @@ fn restore_with_snapshot_sets_commit_base() {
             command: b"set d 4".to_vec(),
         },
     ];
-    n.restore(3, None, 10, 2, entries);
+    n.restore(Restore {
+        term: 3,
+        snapshot_index: 10,
+        snapshot_term: 2,
+        entries,
+        ..Default::default()
+    });
 
     assert_eq!(
         n.commit_index, 10,
@@ -260,7 +274,7 @@ fn restore_with_snapshot_sets_commit_base() {
 #[test]
 fn restore_empty_wal_is_noop() {
     let mut n = node(1, vec![2, 3]);
-    n.restore(0, None, 0, 0, vec![]);
+    n.restore(Restore::default());
     assert_eq!(n.current_term, 0);
     assert_eq!(n.log.last_index(), 0);
 }
@@ -269,7 +283,11 @@ fn restore_empty_wal_is_noop() {
 fn restore_does_not_emit_hard_state_into_ready() {
     // restore() is not a step() — it must not leave stale Ready output.
     let mut n = node(1, vec![2, 3]);
-    n.restore(5, Some(2), 0, 0, vec![]);
+    n.restore(Restore {
+        term: 5,
+        voted_for: Some(2),
+        ..Default::default()
+    });
     // The next step() should return an empty Ready (no leftover from restore).
     let ready = n.step(Message::Tick);
     assert!(
@@ -748,4 +766,120 @@ fn install_snapshot_sets_leader_to_sender() {
         "must not record itself as leader"
     );
     assert!(!n.is_leader());
+}
+
+// ── The commit index has to survive a restart ─────────────────────────────
+//
+// 0.1.3 persisted only term and voted_for, and `restore` reset both
+// commit_index and last_applied to the snapshot base. The Raft dissertation
+// does treat commitIndex as volatile — but this implementation builds guards on
+// top of it, and a restart made them vacuous. The anti-truncation floor added
+// in v0.1.3 is the sharpest example: its comment says it "can never rewind
+// below a committed entry", and after a restart it could.
+
+#[test]
+fn a_restored_node_does_not_offer_to_rewind_below_its_committed_prefix() {
+    let mut n = node(1, vec![2, 3]);
+    n.restore(Restore {
+        term: 3,
+        commit: 40,
+        snapshot_index: 10,
+        snapshot_term: 3,
+        entries: (11..=50).map(|i| entry(i, 3)).collect(),
+        ..Default::default()
+    });
+    assert_eq!(n.commit_index, 40, "the durable commit index is recovered");
+
+    // A leader probes at an index inside the committed prefix and the terms
+    // disagree, so the follower answers with a rollback hint.
+    let ready = n.step(Message::AppendEntries {
+        from: 2,
+        msg: AppendEntries {
+            term: 5,
+            leader_id: 2,
+            prev_log_index: 20,
+            prev_log_term: 99,
+            entries: vec![],
+            leader_commit: 40,
+        },
+    });
+
+    // Floored at commit_index + 1. With commit_index reset to the snapshot base
+    // the walk-back would have run all the way down to 11 — offering to erase
+    // entries 11..40 that this node had already acknowledged as committed.
+    assert_eq!(
+        failure_hint(&ready),
+        41,
+        "the hint must never rewind below a committed entry"
+    );
+}
+
+#[test]
+fn restore_re_applies_the_committed_entries_above_the_snapshot() {
+    // The state machine starts at the snapshot — entries above it were never
+    // written to the store — but the commit index says those entries are
+    // committed, so they are staged for re-application instead of waiting for a
+    // leader to re-drive them. 0.1.3 set both indices to the snapshot base and
+    // staged nothing.
+    let mut n = node(1, vec![2, 3]);
+    n.restore(Restore {
+        term: 3,
+        commit: 15,
+        snapshot_index: 10,
+        snapshot_term: 3,
+        entries: (11..=20).map(|i| entry(i, 3)).collect(),
+        ..Default::default()
+    });
+
+    assert_eq!(n.commit_index, 15, "the commit index is durable");
+    let staged = n.take_ready();
+    assert_eq!(
+        staged
+            .entries_to_apply
+            .iter()
+            .map(|e| e.index)
+            .collect::<Vec<_>>(),
+        (11..=15).collect::<Vec<_>>(),
+        "exactly the committed entries the snapshot does not cover"
+    );
+    assert_eq!(
+        n.last_applied, 15,
+        "and nothing above the commit index is replayed"
+    );
+}
+
+#[test]
+fn a_persisted_commit_above_the_recovered_log_is_clamped() {
+    // The WAL's tail can be torn away after the commit index reached disk. The
+    // entries the commit names are then simply not there to apply.
+    let mut n = node(1, vec![2, 3]);
+    n.restore(Restore {
+        term: 3,
+        commit: 100,
+        snapshot_index: 10,
+        snapshot_term: 3,
+        entries: (11..=20).map(|i| entry(i, 3)).collect(),
+        ..Default::default()
+    });
+    assert_eq!(n.commit_index, 20, "clamped to what the log actually holds");
+}
+
+#[test]
+fn advancing_the_commit_index_emits_hard_state() {
+    // Persisting the commit index is only worth anything if it is written when
+    // it moves, not just on a term or vote change.
+    let (mut leader, _follower) = run_election();
+    let ready = leader.step(Message::AppendEntriesResponse {
+        from: 2,
+        msg: AppendEntriesResponse {
+            term: leader.current_term,
+            success: true,
+            match_index: leader.log.last_index(),
+        },
+    });
+    let hard_state = ready
+        .hard_state
+        .expect("a commit advance must reach durable storage");
+    assert_eq!(hard_state.commit, leader.commit_index);
+    assert!(hard_state.commit > 0);
 }

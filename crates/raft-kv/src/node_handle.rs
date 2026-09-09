@@ -14,7 +14,7 @@ use tracing::{debug, warn};
 
 use raft::{
     message::EntryType, ConfChangeCmd, ConfChangeOp, Config, HardState, LogEntry, LogIndex,
-    Message, NodeId, RaftNode, Ready, Snapshot, Term,
+    Message, NodeId, RaftNode, Ready, Restore, Snapshot, Term,
 };
 use storage::kv::Command;
 use storage::wal::WalRecord;
@@ -121,13 +121,41 @@ impl NodeHandle {
             last_snapshot = Some(snap);
         }
         if replay.has_state {
-            node.restore(
-                replay.term,
-                replay.voted_for,
+            node.restore(Restore {
+                term: replay.term,
+                voted_for: replay.voted_for,
+                commit: replay.commit,
                 snapshot_index,
                 snapshot_term,
-                replay.entries,
-            );
+                entries: replay.entries,
+            });
+            // Entries between the snapshot and the persisted commit are
+            // committed but absent from the store: the snapshot only carries
+            // state up to its own index. Re-applying them here, before the
+            // embedder has had a chance to subscribe, rebuilds the state
+            // machine without replaying those writes as fresh events on
+            // anyone's watch stream.
+            let staged = node.take_ready();
+            if !staged.entries_to_apply.is_empty() {
+                let mut kv_guard = kv.try_lock().expect("kv is uncontended during startup");
+                for entry in &staged.entries_to_apply {
+                    if let Err(e) = kv_guard.apply(&entry.command) {
+                        warn!(index = entry.index, "KV re-apply on restart failed: {e}");
+                    }
+                }
+                drop(kv_guard);
+                applied = staged
+                    .entries_to_apply
+                    .iter()
+                    .map(|e| e.index)
+                    .max()
+                    .unwrap_or(applied);
+                debug!(
+                    from = snapshot_index,
+                    to = applied,
+                    "re-applied committed entries above the snapshot"
+                );
+            }
         }
 
         let (applied_tx, applied_rx) = watch::channel(applied);
@@ -320,15 +348,18 @@ impl NodeHandle {
         // Lock order: the WAL is always taken first.
         let mut wal = self.wal.lock().await;
 
-        let (last_term, term, voted_for) = {
+        let (last_term, hard_state) = {
             let node = self.node.lock().await;
             if target <= node.log.snapshot_index() || target > node.last_applied {
                 return;
             }
             (
                 node.log.term_at(target).unwrap_or(0),
-                node.current_term,
-                node.voted_for,
+                WalRecord::HardState {
+                    term: node.current_term,
+                    voted_for: node.voted_for,
+                    commit: node.commit_index,
+                },
             )
         };
         let data = {
@@ -359,7 +390,7 @@ impl NodeHandle {
         // The rotated file must still carry the hard state: a node that comes
         // back without its term and vote can vote twice in one term.
         let mut records = Vec::with_capacity(tail.len() + 1);
-        records.push(WalRecord::HardState { term, voted_for });
+        records.push(hard_state);
         let kept = tail.len();
         records.extend(tail.into_iter().map(WalRecord::Entry));
         if let Err(e) = wal.rewrite(&records) {
@@ -392,24 +423,29 @@ impl NodeHandle {
                 return;
             }
         }
-        let (term, voted_for) = {
+        let hard_state = {
             let mut node = self.node.lock().await;
             let (term, voted_for) = (node.current_term, node.voted_for);
-            node.restore(
+            node.restore(Restore {
                 term,
                 voted_for,
-                snapshot.last_index,
-                snapshot.last_term,
-                vec![],
-            );
-            (term, voted_for)
+                commit: snapshot.last_index,
+                snapshot_index: snapshot.last_index,
+                snapshot_term: snapshot.last_term,
+                entries: vec![],
+            });
+            WalRecord::HardState {
+                term,
+                voted_for,
+                commit: node.commit_index,
+            }
         };
         if let Err(e) = self.snapshots.save(&snapshot) {
             warn!("snapshot write failed: {e}");
         } else {
             // Every entry the WAL held is covered by the installed snapshot;
             // only the hard state has to survive the rotation.
-            if let Err(e) = wal.rewrite(&[WalRecord::HardState { term, voted_for }]) {
+            if let Err(e) = wal.rewrite(&[hard_state]) {
                 warn!("WAL rotation after InstallSnapshot failed: {e}");
             }
         }
@@ -429,8 +465,11 @@ impl NodeHandle {
         self.pending_proposals.lock().await.clear();
     }
 
-    /// If a hard state change just happened and we are no longer leader, drain proposals.
-    /// `hard_state.is_some()` is a cheap filter: term/voted_for only change on role transitions.
+    /// If durable state just changed and we are no longer leader, drain
+    /// proposals. `hard_state.is_some()` is a cheap pre-filter — it now also
+    /// fires when the commit index advances, which is harmless: the drain only
+    /// happens when this node is not the leader, and then dropping the
+    /// proposals is right regardless of what moved.
     async fn drain_if_lost_leadership(&self, ready: &Ready) {
         if ready.hard_state.is_some() && !self.node.lock().await.is_leader() {
             self.drain_pending_proposals().await;
@@ -464,8 +503,17 @@ impl NodeHandle {
         // Batch the whole Ready into one WAL write so a single fsync covers
         // the HardState and every entry.
         let mut batch = Vec::new();
-        if let Some(HardState { term, voted_for }) = ready.hard_state {
-            batch.push(WalRecord::HardState { term, voted_for });
+        if let Some(HardState {
+            term,
+            voted_for,
+            commit,
+        }) = ready.hard_state
+        {
+            batch.push(WalRecord::HardState {
+                term,
+                voted_for,
+                commit,
+            });
         }
         for entry in &ready.entries_to_persist {
             batch.push(WalRecord::Entry(entry.clone()));
@@ -671,6 +719,8 @@ fn should_compact(max_index: LogIndex, floor: LogIndex, threshold: u64) -> bool 
 pub struct WalReplay {
     pub term: Term,
     pub voted_for: Option<NodeId>,
+    /// Last commit index that reached disk. See `raft::HardState::commit`.
+    pub commit: LogIndex,
     /// The newest snapshot seen, from the WAL (0.1.x) or adopted from the
     /// snapshot store.
     pub snapshot: Option<Snapshot>,
@@ -687,9 +737,14 @@ impl WalReplay {
     pub fn push(&mut self, record: WalRecord) {
         self.has_state = true;
         match record {
-            WalRecord::HardState { term, voted_for } => {
+            WalRecord::HardState {
+                term,
+                voted_for,
+                commit,
+            } => {
                 self.term = term;
                 self.voted_for = voted_for;
+                self.commit = self.commit.max(commit);
             }
             WalRecord::Entry(entry) => {
                 // Truncate anything at this index or beyond, then push: the same
@@ -734,6 +789,7 @@ impl WalReplay {
         records.push(WalRecord::HardState {
             term: self.term,
             voted_for: self.voted_for,
+            commit: self.commit,
         });
         records.extend(self.entries.iter().cloned().map(WalRecord::Entry));
         records
@@ -777,7 +833,11 @@ mod tests {
     }
 
     fn hard_state(term: u64, voted_for: Option<u64>) -> WalRecord {
-        WalRecord::HardState { term, voted_for }
+        WalRecord::HardState {
+            term,
+            voted_for,
+            commit: 0,
+        }
     }
 
     // ── WalReplay ─────────────────────────────────────────────────────────────
@@ -992,6 +1052,7 @@ mod tests {
                 hard_state: Some(raft::HardState {
                     term: 3,
                     voted_for: Some(2),
+                    commit: 0,
                 }),
                 ..Default::default()
             };
@@ -1279,6 +1340,72 @@ mod tests {
                 restarted.kv.lock().await.get("px:060:001"),
                 Some("7"),
                 "the state machine is rebuilt from the snapshot file"
+            );
+        });
+    }
+
+    // ── The commit index must survive a restart, end to end ──────────────────
+    //
+    // 0.1.3 persisted only term and voted_for, so a restarted node reported a
+    // commit index of `snapshot_index` — which is what made node1 look wedged
+    // during the incident, and what let a restarted leader satisfy a
+    // linearizable read from a state machine that was behind.
+    #[test]
+    fn a_restart_recovers_the_commit_index_and_re_applies_above_the_snapshot() {
+        use std::collections::BTreeMap;
+
+        // The snapshot covers writes up to index 50. Entries 51..=55 committed
+        // after it and live only in the WAL.
+        let board = BTreeMap::from([("px:001:001".to_string(), "1".to_string())]);
+        let mut records = vec![WalRecord::Snapshot {
+            last_index: 50,
+            last_term: 3,
+            data: serde_json::to_vec(&board).unwrap(),
+        }];
+        records.extend((51..=55u64).map(|i| {
+            WalRecord::Entry(LogEntry {
+                index: i,
+                term: 3,
+                entry_type: EntryType::Normal,
+                command: serde_json::to_vec(&Command::Set {
+                    key: format!("px:{i:03}:002"),
+                    value: "9".to_string(),
+                })
+                .unwrap(),
+            })
+        }));
+        records.push(WalRecord::HardState {
+            term: 3,
+            voted_for: Some(1),
+            commit: 55,
+        });
+
+        let dir = tempfile::tempdir().unwrap();
+        let handle = make_restarted_handle(dir.path(), WalReplay::from_records(records));
+
+        let rt = tokio::runtime::Runtime::new().unwrap();
+        rt.block_on(async {
+            assert_eq!(
+                handle.node.lock().await.commit_index,
+                55,
+                "the durable commit index is recovered, not reset to the snapshot base"
+            );
+            let kv = handle.kv.lock().await;
+            assert_eq!(
+                kv.get("px:001:001"),
+                Some("1"),
+                "state up to the snapshot comes from the snapshot"
+            );
+            assert_eq!(
+                kv.get("px:055:002"),
+                Some("9"),
+                "and the committed entries above it are re-applied from the WAL"
+            );
+            drop(kv);
+            assert_eq!(
+                *handle.subscribe_applied().borrow(),
+                55,
+                "a linearizable read must not be satisfied by a stale wait"
             );
         });
     }

@@ -8,6 +8,23 @@ pub type LogIndex = u64;
 pub struct HardState {
     pub term: Term,
     pub voted_for: Option<NodeId>,
+    /// Highest commit index this node has made durable.
+    ///
+    /// The Raft dissertation treats commitIndex as volatile, recoverable from
+    /// the leader, so persisting it is not required for §5 safety. But this
+    /// implementation builds guards *on top of* commit_index, and they go
+    /// silently vacuous when it resets to the snapshot base on restart:
+    ///
+    /// - the anti-truncation floor in `conflict_hint` collapses to
+    ///   `snapshot_index + 1`, so a restarted node offers to rewind over
+    ///   entries it had already acknowledged as committed;
+    /// - `read_index_if_leader` returns a read index near the snapshot base, so
+    ///   a linearizable read's wait-for-apply is trivially satisfied and the
+    ///   read can be served from a state machine that is behind.
+    ///
+    /// `default` keeps 0.1.x WALs readable.
+    #[serde(default)]
+    pub commit: LogIndex,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Default)]
