@@ -129,6 +129,7 @@ impl RaftService for RaftGrpc {
         Ok(Response::new(ProtoISResponse {
             term: isr.term,
             success: isr.success,
+            last_index: isr.last_index,
         }))
     }
 }

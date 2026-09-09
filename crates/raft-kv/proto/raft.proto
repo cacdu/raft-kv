@@ -52,4 +52,8 @@ message InstallSnapshotRequest {
 message InstallSnapshotResponse {
     uint64 term    = 1;
     bool   success = 2;
+    // Index of the snapshot the follower actually installed. The leader must
+    // advance the peer to *this*, not to its own current snapshot index, which
+    // may have moved on since the RPC was sent. 0 from a pre-0.1.4 peer.
+    uint64 last_index = 3;
 }

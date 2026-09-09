@@ -83,6 +83,7 @@ impl PeerClient {
                     msg: InstallSnapshotResponse {
                         term: r.term,
                         success: r.success,
+                        last_index: r.last_index,
                     },
                 })
             }

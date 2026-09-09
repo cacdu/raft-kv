@@ -20,6 +20,7 @@
 //!     learner: false,
 //!     election_timeout: 0,   // 0 = built-in default (10 ticks); raise for a WAN
 //!     heartbeat_timeout: 0,  // 0 = built-in default (3 ticks)
+//!     compaction_threshold: 0, // 0 = built-in default (a snapshot every 5000 applies)
 //! })
 //! .await?;
 //!

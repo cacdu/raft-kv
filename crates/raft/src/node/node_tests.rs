@@ -1,8 +1,8 @@
-use super::{RaftNode, Ready, Role};
+use super::{RaftNode, Ready, Restore, Role};
 use crate::config::Config;
 use crate::message::{
-    AppendEntries, AppendEntriesResponse, EntryType, InstallSnapshot, LogEntry, Message, NodeId,
-    RequestVote, Snapshot,
+    AppendEntries, AppendEntriesResponse, EntryType, InstallSnapshot, InstallSnapshotResponse,
+    LogEntry, Message, NodeId, RequestVote, Snapshot,
 };
 
 fn node(id: u64, peers: Vec<u64>) -> RaftNode {
@@ -196,7 +196,11 @@ fn refusing_vote_does_not_emit_hard_state() {
 #[test]
 fn restore_sets_hard_state() {
     let mut n = node(1, vec![2, 3]);
-    n.restore(7, Some(2), 0, 0, vec![]);
+    n.restore(Restore {
+        term: 7,
+        voted_for: Some(2),
+        ..Default::default()
+    });
     assert_eq!(n.current_term, 7);
     assert_eq!(n.voted_for, Some(2));
 }
@@ -218,7 +222,11 @@ fn restore_loads_log_entries() {
             command: b"set b 2".to_vec(),
         },
     ];
-    n.restore(1, None, 0, 0, entries);
+    n.restore(Restore {
+        term: 1,
+        entries,
+        ..Default::default()
+    });
 
     assert_eq!(n.log.last_index(), 2);
     assert_eq!(n.log.term_at(1), Some(1));
@@ -243,7 +251,13 @@ fn restore_with_snapshot_sets_commit_base() {
             command: b"set d 4".to_vec(),
         },
     ];
-    n.restore(3, None, 10, 2, entries);
+    n.restore(Restore {
+        term: 3,
+        snapshot_index: 10,
+        snapshot_term: 2,
+        entries,
+        ..Default::default()
+    });
 
     assert_eq!(
         n.commit_index, 10,
@@ -260,7 +274,7 @@ fn restore_with_snapshot_sets_commit_base() {
 #[test]
 fn restore_empty_wal_is_noop() {
     let mut n = node(1, vec![2, 3]);
-    n.restore(0, None, 0, 0, vec![]);
+    n.restore(Restore::default());
     assert_eq!(n.current_term, 0);
     assert_eq!(n.log.last_index(), 0);
 }
@@ -269,7 +283,11 @@ fn restore_empty_wal_is_noop() {
 fn restore_does_not_emit_hard_state_into_ready() {
     // restore() is not a step() — it must not leave stale Ready output.
     let mut n = node(1, vec![2, 3]);
-    n.restore(5, Some(2), 0, 0, vec![]);
+    n.restore(Restore {
+        term: 5,
+        voted_for: Some(2),
+        ..Default::default()
+    });
     // The next step() should return an empty Ready (no leftover from restore).
     let ready = n.step(Message::Tick);
     assert!(
@@ -748,4 +766,248 @@ fn install_snapshot_sets_leader_to_sender() {
         "must not record itself as leader"
     );
     assert!(!n.is_leader());
+}
+
+// ── The commit index has to survive a restart ─────────────────────────────
+//
+// 0.1.3 persisted only term and voted_for, and `restore` reset both
+// commit_index and last_applied to the snapshot base. The Raft dissertation
+// does treat commitIndex as volatile — but this implementation builds guards on
+// top of it, and a restart made them vacuous. The anti-truncation floor added
+// in v0.1.3 is the sharpest example: its comment says it "can never rewind
+// below a committed entry", and after a restart it could.
+
+#[test]
+fn a_restored_node_does_not_offer_to_rewind_below_its_committed_prefix() {
+    let mut n = node(1, vec![2, 3]);
+    n.restore(Restore {
+        term: 3,
+        commit: 40,
+        snapshot_index: 10,
+        snapshot_term: 3,
+        entries: (11..=50).map(|i| entry(i, 3)).collect(),
+        ..Default::default()
+    });
+    assert_eq!(n.commit_index, 40, "the durable commit index is recovered");
+
+    // A leader probes at an index inside the committed prefix and the terms
+    // disagree, so the follower answers with a rollback hint.
+    let ready = n.step(Message::AppendEntries {
+        from: 2,
+        msg: AppendEntries {
+            term: 5,
+            leader_id: 2,
+            prev_log_index: 20,
+            prev_log_term: 99,
+            entries: vec![],
+            leader_commit: 40,
+        },
+    });
+
+    // Floored at commit_index + 1. With commit_index reset to the snapshot base
+    // the walk-back would have run all the way down to 11 — offering to erase
+    // entries 11..40 that this node had already acknowledged as committed.
+    assert_eq!(
+        failure_hint(&ready),
+        41,
+        "the hint must never rewind below a committed entry"
+    );
+}
+
+#[test]
+fn restore_re_applies_the_committed_entries_above_the_snapshot() {
+    // The state machine starts at the snapshot — entries above it were never
+    // written to the store — but the commit index says those entries are
+    // committed, so they are staged for re-application instead of waiting for a
+    // leader to re-drive them. 0.1.3 set both indices to the snapshot base and
+    // staged nothing.
+    let mut n = node(1, vec![2, 3]);
+    n.restore(Restore {
+        term: 3,
+        commit: 15,
+        snapshot_index: 10,
+        snapshot_term: 3,
+        entries: (11..=20).map(|i| entry(i, 3)).collect(),
+        ..Default::default()
+    });
+
+    assert_eq!(n.commit_index, 15, "the commit index is durable");
+    let staged = n.take_ready();
+    assert_eq!(
+        staged
+            .entries_to_apply
+            .iter()
+            .map(|e| e.index)
+            .collect::<Vec<_>>(),
+        (11..=15).collect::<Vec<_>>(),
+        "exactly the committed entries the snapshot does not cover"
+    );
+    assert_eq!(
+        n.last_applied, 15,
+        "and nothing above the commit index is replayed"
+    );
+}
+
+#[test]
+fn a_persisted_commit_above_the_recovered_log_is_clamped() {
+    // The WAL's tail can be torn away after the commit index reached disk. The
+    // entries the commit names are then simply not there to apply.
+    let mut n = node(1, vec![2, 3]);
+    n.restore(Restore {
+        term: 3,
+        commit: 100,
+        snapshot_index: 10,
+        snapshot_term: 3,
+        entries: (11..=20).map(|i| entry(i, 3)).collect(),
+        ..Default::default()
+    });
+    assert_eq!(n.commit_index, 20, "clamped to what the log actually holds");
+}
+
+#[test]
+fn advancing_the_commit_index_emits_hard_state() {
+    // Persisting the commit index is only worth anything if it is written when
+    // it moves, not just on a term or vote change.
+    let (mut leader, _follower) = run_election();
+    let ready = leader.step(Message::AppendEntriesResponse {
+        from: 2,
+        msg: AppendEntriesResponse {
+            term: leader.current_term,
+            success: true,
+            match_index: leader.log.last_index(),
+        },
+    });
+    let hard_state = ready
+        .hard_state
+        .expect("a commit advance must reach durable storage");
+    assert_eq!(hard_state.commit, leader.commit_index);
+    assert!(hard_state.commit > 0);
+}
+
+// ── A lagging peer must be credited with the snapshot it actually got ─────
+//
+// `handle_install_snapshot_response` advanced the peer to the *leader's*
+// current `log.snapshot_index()`. If the leader compacted again between
+// sending the RPC and reading the reply, the peer was credited with entries it
+// had never seen, and those entries could then be counted towards a quorum.
+
+#[test]
+fn an_install_snapshot_response_advances_the_peer_to_what_it_installed() {
+    let (mut leader, _follower) = run_election();
+    let term = leader.current_term;
+    for index in leader.log.last_index() + 1..=20 {
+        leader.log.append(entry(index, term));
+    }
+    leader.commit_index = 20;
+    leader.last_applied = 20;
+    // The leader has moved on since the snapshot went out.
+    leader.log.compact(15, term);
+    if let Role::Leader {
+        next_index,
+        match_index,
+    } = &mut leader.role
+    {
+        next_index.insert(2, 1);
+        match_index.insert(2, 0);
+    }
+
+    leader.step(Message::InstallSnapshotResponse {
+        from: 2,
+        msg: InstallSnapshotResponse {
+            term,
+            success: true,
+            last_index: 8,
+        },
+    });
+
+    let Role::Leader {
+        next_index,
+        match_index,
+    } = &leader.role
+    else {
+        panic!("the leader must still be the leader");
+    };
+    assert_eq!(
+        match_index[&2], 8,
+        "the peer installed snapshot 8, not the leader's current 15"
+    );
+    assert_eq!(next_index[&2], 9);
+}
+
+#[test]
+fn a_peer_that_reports_no_index_keeps_the_old_behaviour() {
+    // Pre-0.1.4 followers do not fill the field in; 0 must not be read as
+    // "the peer installed nothing".
+    let (mut leader, _follower) = run_election();
+    let term = leader.current_term;
+    for index in leader.log.last_index() + 1..=20 {
+        leader.log.append(entry(index, term));
+    }
+    leader.commit_index = 20;
+    leader.last_applied = 20;
+    leader.log.compact(15, term);
+    if let Role::Leader {
+        next_index,
+        match_index,
+    } = &mut leader.role
+    {
+        next_index.insert(2, 1);
+        match_index.insert(2, 0);
+    }
+
+    leader.step(Message::InstallSnapshotResponse {
+        from: 2,
+        msg: InstallSnapshotResponse {
+            term,
+            success: true,
+            last_index: 0,
+        },
+    });
+
+    let Role::Leader { match_index, .. } = &leader.role else {
+        panic!("the leader must still be the leader");
+    };
+    assert_eq!(match_index[&2], 15);
+}
+
+#[test]
+fn a_node_with_an_empty_log_can_install_a_snapshot_from_far_ahead() {
+    // The whole point of InstallSnapshot: the follower is so far behind that
+    // the leader has no entries left to send it. Compacting to an index beyond
+    // the end of the log used to panic.
+    let mut n = node(3, vec![1, 2]);
+    let ready = n.step(Message::InstallSnapshot {
+        from: 1,
+        msg: InstallSnapshot {
+            term: 7,
+            leader_id: 1,
+            snapshot: Snapshot {
+                last_index: 49_400,
+                last_term: 7,
+                data: b"{}".to_vec(),
+            },
+        },
+    });
+
+    assert_eq!(n.log.snapshot_index(), 49_400);
+    assert_eq!(
+        n.log.last_index(),
+        49_400,
+        "nothing survives below the base"
+    );
+    assert_eq!(n.commit_index, 49_400);
+    assert!(
+        ready.snapshot_to_apply.is_some(),
+        "the state machine must be handed the snapshot to apply"
+    );
+    let hint = ready
+        .messages
+        .iter()
+        .find_map(|(_, m)| match m {
+            Message::InstallSnapshotResponse { msg, .. } => Some(msg),
+            _ => None,
+        })
+        .expect("the follower must answer");
+    assert!(hint.success);
+    assert_eq!(hint.last_index, 49_400);
 }

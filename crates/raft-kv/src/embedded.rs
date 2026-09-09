@@ -3,14 +3,24 @@
 /// `RaftKv::start` owns everything the node needs to run: it opens the WAL,
 /// replays it, spawns the gRPC peer server and the tick loop. The returned
 /// handle is `Clone` and cheap to share across tasks.
-use std::{collections::HashMap, net::SocketAddr, path::PathBuf, sync::Arc, time::Duration};
+use std::{
+    collections::HashMap,
+    net::SocketAddr,
+    path::{Path, PathBuf},
+    sync::Arc,
+    time::Duration,
+};
 
 use tokio::sync::{broadcast, Mutex};
+use tracing::info;
 
 use raft::NodeId;
-use storage::{kv::Command, KvStore, Wal};
+use storage::{kv::Command, wal::WalError, KvStore, SnapshotStore, Wal};
 
-use crate::{events::Event, node_handle::NodeHandle};
+use crate::{
+    events::Event,
+    node_handle::{NodeHandle, NodeHandleConfig, WalReplay},
+};
 
 /// How long a write waits for quorum commit, and a read waits for apply.
 const COMMIT_TIMEOUT: Duration = Duration::from_secs(5);
@@ -37,6 +47,11 @@ pub struct RaftKvOptions {
     /// Ticks between leader heartbeats (10ms per tick). Must be `<<` the
     /// election timeout. `0` keeps the built-in default (3 ticks).
     pub heartbeat_timeout: u32,
+    /// Applied entries between snapshots. Each one serializes the whole state
+    /// machine and rotates the WAL, so this trades write amplification against
+    /// how much log a restart (or a lagging peer) has to replay. `0` keeps the
+    /// built-in default (5000).
+    pub compaction_threshold: u64,
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -78,31 +93,40 @@ impl RaftKv {
     pub async fn start(opts: RaftKvOptions) -> anyhow::Result<Self> {
         std::fs::create_dir_all(&opts.data_dir)?;
         let wal_path = opts.data_dir.join(format!("node-{}.wal", opts.id));
-        let (wal, records) = Wal::open(&wal_path)?;
+        let snapshots = SnapshotStore::new(&opts.data_dir);
+
+        // Fold the WAL as it is read rather than materializing it: a file that
+        // has never been rotated holds every snapshot ever appended.
+        let mut replay = WalReplay::default();
+        let mut wal = Wal::open_with(&wal_path, |record| replay.push(record))?;
+        if let Some(snapshot) = snapshots.load_latest()? {
+            replay.adopt(snapshot);
+        }
+        if wal.is_legacy() || replay.snapshot_in_wal {
+            migrate_wal(&mut wal, &wal_path, &replay, &snapshots)?;
+        }
+
         let wal = Arc::new(Mutex::new(wal));
         let kv = Arc::new(Mutex::new(KvStore::default()));
 
-        let raft_config = build_raft_config(
-            opts.id,
-            opts.peers.keys().copied().collect(),
-            opts.election_timeout,
-            opts.heartbeat_timeout,
-        );
-        let handle = if opts.learner {
-            Arc::new(NodeHandle::new_learner(
-                raft_config,
-                records,
-                Arc::clone(&kv),
-                Arc::clone(&wal),
-            ))
-        } else {
-            Arc::new(NodeHandle::new(
-                raft_config,
-                records,
-                Arc::clone(&kv),
-                Arc::clone(&wal),
-            ))
+        let node_config = NodeHandleConfig {
+            raft: build_raft_config(
+                opts.id,
+                opts.peers.keys().copied().collect(),
+                opts.election_timeout,
+                opts.heartbeat_timeout,
+            ),
+            replay,
+            kv: Arc::clone(&kv),
+            wal: Arc::clone(&wal),
+            snapshots,
+            compaction_threshold: opts.compaction_threshold,
         };
+        let handle = Arc::new(if opts.learner {
+            NodeHandle::new_learner(node_config)
+        } else {
+            NodeHandle::new(node_config)
+        });
         handle.register_peers(opts.peers, opts.app_addrs).await;
 
         let grpc_addr: SocketAddr = opts.raft_addr.parse()?;
@@ -259,6 +283,65 @@ impl RaftKv {
     }
 }
 
+/// Move a 0.1.x WAL to the 0.1.4 layout: its newest snapshot becomes a snapshot
+/// file, and the WAL is rewritten down to the hard state plus the entries the
+/// snapshot does not cover.
+///
+/// This is the one-time repair for a node that ran the old layout. node1 in
+/// gambas holds ~988 appended snapshots in a single ~1 GB file on a 1 GB
+/// volume; the migration turns that into a snapshot plus a WAL of the entries
+/// since. The old file is kept under `.wal.legacy` — renaming costs no space —
+/// and the operator can delete it once the node is verified.
+fn migrate_wal(
+    wal: &mut Wal,
+    wal_path: &Path,
+    replay: &WalReplay,
+    snapshots: &SnapshotStore,
+) -> anyhow::Result<()> {
+    if let Some(snapshot) = &replay.snapshot {
+        if snapshots.latest_index()? < Some(snapshot.last_index) {
+            snapshots.save(snapshot)?;
+        }
+    }
+
+    let legacy_path = wal_path.with_extension("wal.legacy");
+    std::fs::rename(wal_path, &legacy_path)?;
+
+    let records = replay.to_records();
+    if let Err(e) = wal.rewrite(&records) {
+        // A volume with no room left is exactly how this node got here, so the
+        // one case worth handling is ENOSPC: drop the copy and try once more.
+        if is_out_of_space(&e) {
+            tracing::warn!(
+                path = %legacy_path.display(),
+                "no space to rotate the WAL; dropping the legacy copy and retrying"
+            );
+            std::fs::remove_file(&legacy_path)?;
+            wal.rewrite(&records)?;
+        } else {
+            // Put the original back rather than leaving the node with no WAL
+            // under its own name.
+            std::fs::rename(&legacy_path, wal_path)?;
+            return Err(e.into());
+        }
+    }
+
+    info!(
+        legacy = %legacy_path.display(),
+        snapshot_index = replay.snapshot_index(),
+        entries_kept = replay.entries.len(),
+        "migrated a 0.1.x WAL: snapshots now live in their own files, \
+         the legacy copy can be deleted once this node is verified"
+    );
+    Ok(())
+}
+
+/// ENOSPC by raw errno: `io::ErrorKind::StorageFull` is newer than this
+/// crate's MSRV.
+fn is_out_of_space(e: &WalError) -> bool {
+    matches!(e, WalError::Io(io) if io.raw_os_error() == Some(28))
+}
+
 /// Build the Raft config, overriding the election/heartbeat timeouts only when
 /// the caller supplies a non-zero value. `0` means "keep the built-in default",
 /// which also avoids the empty `election_timeout..2*election_timeout` range
@@ -281,7 +364,108 @@ fn build_raft_config(
 
 #[cfg(test)]
 mod tests {
-    use super::build_raft_config;
+    use std::collections::BTreeMap;
+
+    use raft::{message::EntryType, LogEntry};
+    use storage::wal::WalRecord;
+
+    use super::{build_raft_config, migrate_wal, Command, SnapshotStore, Wal, WalReplay};
+
+    // ── A 0.1.x WAL has to migrate itself out of the old layout ──────────────
+    //
+    // 0.1.x appended the whole serialized store into the WAL on every
+    // compaction and never dropped anything: node1's file is ~1 GB of entries
+    // and ~988 snapshot blobs, on a 1 GB volume. Startup moves the newest
+    // snapshot into a file of its own and rewrites the WAL down to the hard
+    // state plus the entries the snapshot does not cover.
+
+    fn entry(index: u64) -> WalRecord {
+        WalRecord::Entry(LogEntry {
+            index,
+            term: 4,
+            entry_type: EntryType::Normal,
+            command: serde_json::to_vec(&Command::Set {
+                key: format!("px:{index:03}:001"),
+                value: "7".to_string(),
+            })
+            .unwrap(),
+        })
+    }
+
+    #[test]
+    fn migrating_moves_the_wal_snapshot_into_a_file_and_shrinks_the_log() {
+        let dir = tempfile::tempdir().unwrap();
+        let wal_path = dir.path().join("node-1.wal");
+        let snapshots = SnapshotStore::new(dir.path());
+
+        let board = serde_json::to_vec(&BTreeMap::from([(
+            "px:001:001".to_string(),
+            "7".to_string(),
+        )]))
+        .unwrap();
+        {
+            let (mut wal, _) = Wal::open(&wal_path).unwrap();
+            wal.append(&WalRecord::HardState {
+                term: 4,
+                voted_for: Some(1),
+                commit: 51,
+            })
+            .unwrap();
+            for index in 1..=50 {
+                wal.append(&entry(index)).unwrap();
+            }
+            wal.append(&WalRecord::Snapshot {
+                last_index: 50,
+                last_term: 4,
+                data: board.clone(),
+            })
+            .unwrap();
+            wal.append(&entry(51)).unwrap();
+        }
+        let before = wal_path.metadata().unwrap().len();
+
+        let mut replay = WalReplay::default();
+        let mut wal = Wal::open_with(&wal_path, |r| replay.push(r)).unwrap();
+        assert!(replay.snapshot_in_wal, "the old layout must be detected");
+        migrate_wal(&mut wal, &wal_path, &replay, &snapshots).unwrap();
+
+        assert_eq!(
+            snapshots.load_latest().unwrap().unwrap().data,
+            board,
+            "the snapshot moves into a file of its own"
+        );
+        assert!(
+            dir.path().join("node-1.wal.legacy").exists(),
+            "the original is renamed aside, not deleted — a rename costs no space"
+        );
+        assert!(
+            wal_path.metadata().unwrap().len() < before,
+            "and the live WAL is rewritten down"
+        );
+
+        // Restart on the migrated layout: same durable state, and nothing left
+        // for the migration to do a second time.
+        let mut replay = WalReplay::default();
+        Wal::open_with(&wal_path, |r| replay.push(r)).unwrap();
+        assert!(!replay.snapshot_in_wal);
+        assert_eq!(replay.term, 4);
+        assert_eq!(
+            replay.commit, 51,
+            "the persisted commit index must survive the rotation too"
+        );
+        assert_eq!(
+            replay.voted_for,
+            Some(1),
+            "a node that comes back without its vote can vote twice in one term"
+        );
+        replay.adopt(snapshots.load_latest().unwrap().unwrap());
+        assert_eq!(replay.snapshot_index(), 50);
+        assert_eq!(
+            replay.entries.iter().map(|e| e.index).collect::<Vec<_>>(),
+            vec![51],
+            "only the entries the snapshot does not cover survive"
+        );
+    }
 
     #[test]
     fn nonzero_timeouts_override_the_defaults() {

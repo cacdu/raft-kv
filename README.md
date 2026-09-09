@@ -120,6 +120,9 @@ let node = RaftKv::start(RaftKvOptions {
     app_addrs: [(2, "node2:8080".into()), (3, "node3:8080".into())].into(),
     data_dir: "data".into(),
     learner: false,
+    election_timeout: 0,     // 0 = built-in default (10 ticks); raise for a WAN
+    heartbeat_timeout: 0,    // 0 = built-in default (3 ticks)
+    compaction_threshold: 0, // 0 = built-in default (a snapshot every 5000 applies)
 }).await?;
 
 node.put("hello", "world").await?;     // quorum-committed write (leader only)
