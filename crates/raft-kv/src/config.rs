@@ -28,6 +28,11 @@ pub struct NodeConfig {
     #[arg(long, default_value = "data")]
     pub data_dir: PathBuf,
 
+    /// Applied entries between snapshots. Each snapshot serializes the whole
+    /// store and rotates the WAL. 0 keeps the built-in default (5000).
+    #[arg(long, default_value_t = 0)]
+    pub compaction_threshold: u64,
+
     /// Start as a non-voting learner. The cluster leader must issue POST /cluster/add
     /// with this node's id/addrs before it joins as a full voter.
     #[arg(long, default_value_t = false)]

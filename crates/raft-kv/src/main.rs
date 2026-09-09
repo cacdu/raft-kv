@@ -31,6 +31,7 @@ async fn main() -> Result<()> {
         learner: cfg.learner,
         election_timeout: 0,
         heartbeat_timeout: 0,
+        compaction_threshold: cfg.compaction_threshold,
     })
     .await?;
 

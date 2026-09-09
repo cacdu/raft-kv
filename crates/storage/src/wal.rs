@@ -16,7 +16,7 @@
 /// ends the replay: that is a torn tail, and it is truncated away.
 use std::{
     io::{self, BufReader, Read, Seek, SeekFrom, Write},
-    path::Path,
+    path::{Path, PathBuf},
 };
 
 use crc32fast::Hasher;
@@ -85,10 +85,29 @@ pub enum WalRecord {
 pub struct Wal {
     file: std::fs::File,
     codec: Codec,
+    path: PathBuf,
 }
 
 impl Wal {
+    /// Replay into a `Vec`. Convenient for tests and small logs; a node with a
+    /// 0.1.x WAL should use [`Wal::open_with`] instead, which never holds the
+    /// whole file at once.
     pub fn open(path: impl AsRef<Path>) -> Result<(Self, Vec<WalRecord>), WalError> {
+        let mut records = Vec::new();
+        let wal = Self::open_with(path, |record| records.push(record))?;
+        Ok((wal, records))
+    }
+
+    /// Replay the file record by record, handing each one to `visit`.
+    ///
+    /// Streaming is not a micro-optimization here: a 0.1.x WAL holds every
+    /// snapshot ever appended — ~988 of them at ~2.4 MB each in gambas —
+    /// and materializing them all was an OOM path of its own on a 256 MB
+    /// machine. The caller folds as it goes and keeps only what it needs.
+    pub fn open_with(
+        path: impl AsRef<Path>,
+        mut visit: impl FnMut(WalRecord),
+    ) -> Result<Self, WalError> {
         let path = path.as_ref();
         let mut file = std::fs::OpenOptions::new()
             .read(true)
@@ -98,7 +117,7 @@ impl Wal {
 
         let file_len = file.metadata()?.len();
         let (mut codec, data_start) = Self::detect_codec(&mut file, file_len)?;
-        let (records, valid_len) = Self::read_all(&mut file, data_start, file_len, codec)?;
+        let valid_len = Self::replay(&mut file, data_start, file_len, codec, &mut visit)?;
 
         // A record that was never fsynced was never acknowledged to anyone, so
         // dropping the tail is safe — and it is the only way the node starts at
@@ -125,7 +144,54 @@ impl Wal {
             codec = Codec::PostcardV2;
         }
 
-        Ok((Self { file, codec }, records))
+        Ok(Self {
+            file,
+            codec,
+            path: path.to_path_buf(),
+        })
+    }
+
+    /// True for a 0.1.x file: no format marker, JSON payloads. Such a file is
+    /// still appended in its own codec — the golden copy must not find itself
+    /// half rewritten — so the caller rotates it to migrate.
+    pub fn is_legacy(&self) -> bool {
+        self.codec == Codec::LegacyJson
+    }
+
+    /// Replace the file's contents with `records`, atomically and always as v2.
+    ///
+    /// This is what bounds the WAL. Compaction folds every entry up to the
+    /// snapshot into a snapshot file, and those entries are then dead weight:
+    /// rewriting drops them instead of letting the file grow forever. The live
+    /// file is never truncated in place — a temp file, an fsync, a rename and
+    /// an fsync of the directory mean a crash leaves either the old contents or
+    /// the new ones.
+    ///
+    /// `records` must still carry the durable hard state: a node that comes
+    /// back without its term and vote can vote twice in one term.
+    pub fn rewrite(&mut self, records: &[WalRecord]) -> Result<(), WalError> {
+        let tmp = self.path.with_extension("wal.tmp");
+        {
+            let mut file = std::fs::File::create(&tmp)?;
+            file.write_all(&WAL_MAGIC_V2)?;
+            for record in records {
+                write_frame(&mut file, Codec::PostcardV2, record)?;
+            }
+            file.sync_all()?;
+        }
+        std::fs::rename(&tmp, &self.path)?;
+        if let Some(dir) = self.path.parent() {
+            crate::sync_dir(dir)?;
+        }
+
+        // The old handle still points at the replaced inode; every later append
+        // has to land in the file that now carries the name.
+        self.file = std::fs::OpenOptions::new()
+            .read(true)
+            .append(true)
+            .open(&self.path)?;
+        self.codec = Codec::PostcardV2;
+        Ok(())
     }
 
     /// Decide the on-disk codec once, and return the offset where records
@@ -163,18 +229,7 @@ impl Wal {
     }
 
     fn write_record(&mut self, record: &WalRecord) -> Result<(), WalError> {
-        let payload = encode(self.codec, record)?;
-        let checksum = {
-            let mut h = Hasher::new();
-            h.update(&payload);
-            h.finalize()
-        };
-
-        let len = payload.len() as u32;
-        self.file.write_all(&len.to_le_bytes())?;
-        self.file.write_all(&checksum.to_le_bytes())?;
-        self.file.write_all(&payload)?;
-        Ok(())
+        write_frame(&mut self.file, self.codec, record)
     }
 
     /// Force written records to durable storage. `File::flush` is a no-op for
@@ -186,23 +241,22 @@ impl Wal {
         Ok(())
     }
 
-    /// Replay every intact record and return them together with the offset just
-    /// past the last one. Replay stops at the first record that is short,
-    /// implausible or checksum-invalid: that is a torn tail, which the caller
-    /// truncates away.
+    /// Hand every intact record to `visit` and return the offset just past the
+    /// last one. Replay stops at the first record that is short, implausible or
+    /// checksum-invalid: that is a torn tail, which the caller truncates away.
     ///
     /// A checksum failure on a record that is *not* last is a different animal —
     /// bit rot or a bug, not an interrupted append — and still surfaces as
     /// `Corrupt`, because silently dropping the rest of the log would hide it.
-    fn read_all(
+    fn replay(
         file: &mut std::fs::File,
         start: u64,
         file_len: u64,
         codec: Codec,
-    ) -> Result<(Vec<WalRecord>, u64), WalError> {
+        visit: &mut impl FnMut(WalRecord),
+    ) -> Result<u64, WalError> {
         file.seek(SeekFrom::Start(start))?;
         let mut reader = BufReader::new(&*file);
-        let mut records = Vec::new();
         let mut offset = start;
 
         loop {
@@ -245,12 +299,26 @@ impl Wal {
                 break;
             }
 
-            records.push(decode(codec, &payload)?);
+            visit(decode(codec, &payload)?);
             offset += RECORD_HEADER_LEN + len as u64;
         }
 
-        Ok((records, offset))
+        Ok(offset)
     }
+}
+
+/// Frame one record: length, checksum, payload.
+fn write_frame<W: Write>(writer: &mut W, codec: Codec, record: &WalRecord) -> Result<(), WalError> {
+    let payload = encode(codec, record)?;
+    let checksum = {
+        let mut h = Hasher::new();
+        h.update(&payload);
+        h.finalize()
+    };
+    writer.write_all(&(payload.len() as u32).to_le_bytes())?;
+    writer.write_all(&checksum.to_le_bytes())?;
+    writer.write_all(&payload)?;
+    Ok(())
 }
 
 fn encode(codec: Codec, record: &WalRecord) -> Result<Vec<u8>, WalError> {
@@ -607,6 +675,55 @@ mod tests {
             v2_len * 2 < json_len,
             "a pixel record must cost less than half of its JSON form \
              (v2 {v2_len} B vs json {json_len} B)"
+        );
+    }
+
+    #[test]
+    fn rewrite_drops_the_covered_records_and_migrates_a_legacy_file() {
+        // Rotation is what bounds the WAL: once compaction folds entries into a
+        // snapshot file they are dead weight, and a legacy file migrates to v2
+        // on the way.
+        let tmp = tempfile::NamedTempFile::new().unwrap();
+        write_legacy_wal(
+            tmp.path(),
+            &[pixel_entry(1), pixel_entry(2), pixel_entry(3)],
+        );
+        let before = tmp.path().metadata().unwrap().len();
+
+        let (mut wal, records) = Wal::open(tmp.path()).unwrap();
+        assert_eq!(records.len(), 3);
+        assert!(wal.is_legacy());
+
+        wal.rewrite(&[
+            WalRecord::HardState {
+                term: 4,
+                voted_for: Some(1),
+            },
+            pixel_entry(3),
+        ])
+        .unwrap();
+        assert!(!wal.is_legacy(), "a rewritten file is always v2");
+
+        // The reopened handle must write into the file that now carries the
+        // name, not the replaced inode.
+        wal.append(&pixel_entry(4)).unwrap();
+        drop(wal);
+
+        let (_wal, records) = Wal::open(tmp.path()).unwrap();
+        assert_eq!(records.len(), 3, "hard state + entry 3 + the new entry 4");
+        assert!(
+            matches!(records[0], WalRecord::HardState { term: 4, .. }),
+            "the rotated file must still carry the term and the vote"
+        );
+        match (&records[1], &records[2]) {
+            (WalRecord::Entry(a), WalRecord::Entry(b)) => {
+                assert_eq!((a.index, b.index), (3, 4));
+            }
+            other => panic!("expected two entries, got {other:?}"),
+        }
+        assert!(
+            tmp.path().metadata().unwrap().len() < before,
+            "rotation must shrink the file"
         );
     }
 }
